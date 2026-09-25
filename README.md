@@ -1,1 +1,1 @@
-# Lab-1-Sistemas-inteligentes-y-ciber-f-sicos
+# Lab-1-Sistemas-inteligentes-y-ciber-fisicos
