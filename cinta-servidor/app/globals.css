@@ -1,0 +1,138 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "../vendor/shadcn-tailwind-4.13.0.css";
+
+:root {
+  font-family: 'Segoe UI', Arial, sans-serif;
+  color-scheme: light;
+  --fondo: #f2f5f9;
+  --panel: #fff;
+  --panel-suave: #f6f8fb;
+  --linea: #d8e1eb;
+  --linea-suave: #e8edf3;
+  --texto: #22324a;
+  --texto-2: #5e6e83;
+  --texto-3: #718096;
+  --real: #285fbc;
+  --modelo: #758396;
+  --dinamico: #19775c;
+  --simulacion: #8958aa;
+  --aviso-fondo: #fff2ce;
+  --aviso-texto: #806019;
+  --alarma: #bc3545;
+  --alarma-texto: #b12b3c;
+  --ok: #2c8062;
+  --btn-fondo: #fff;
+  --btn-hover: #edf2f9;
+  --btn-activo: #e5edfc;
+  --btn-borde: #ccd7e5;
+  --visor-fondo: radial-gradient(ellipse at 48% 38%, #fafcfe, #edf2f7 65%, #e7edf4);
+  --primary: var(--real);
+  --primary-foreground: #fff;
+  --background: var(--fondo);
+  --foreground: var(--texto);
+  --border: var(--linea);
+  --input: var(--btn-borde);
+  --ring: var(--real);
+  --destructive: var(--alarma);
+  --muted: var(--panel-suave);
+  --muted-foreground: var(--texto-2);
+}
+[data-theme=oscuro] {
+  color-scheme: dark;
+  --fondo: #151e2b;
+  --panel: #1e2a3b;
+  --panel-suave: #243247;
+  --linea: #36465d;
+  --linea-suave: #2e3d51;
+  --texto: #e6edf7;
+  --texto-2: #acbdd3;
+  --texto-3: #96a9c1;
+  --real: #90b7ff;
+  --modelo: #a5b2c5;
+  --dinamico: #70d4ad;
+  --simulacion: #d5a5f3;
+  --aviso-fondo: #4d4126;
+  --aviso-texto: #f3d58b;
+  --alarma: #bd3949;
+  --alarma-texto: #ff9ca7;
+  --ok: #83d4ad;
+  --btn-fondo: #253449;
+  --btn-hover: #30435c;
+  --btn-activo: #32496c;
+  --btn-borde: #496079;
+  --visor-fondo: radial-gradient(ellipse at 48% 38%, #35475e, #293a51 65%, #233247);
+}
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --font-sans: 'Segoe UI', Arial, sans-serif;
+}
+* {box-sizing:border-box}
+html,body {margin:0;min-height:100%;background:var(--fondo);color:var(--texto)}
+body {font:14px/1.5 'Segoe UI',Arial,sans-serif;font-variant-numeric:tabular-nums}
+button,input,select {font:inherit}
+button,label,[data-slot=checkbox] {-webkit-tap-highlight-color:transparent}
+button {cursor:pointer}
+button:disabled,input:disabled,select:disabled {opacity:.5;cursor:default}
+:is(button,input,select,a,summary):focus-visible {outline:3px solid var(--real);outline-offset:3px}
+button,a {-webkit-user-select:none;user-select:none}
+h1,h2,h3,p {margin:0}
+
+/* The viewer is one dashboard panel; its scene and camera stay unchanged. */
+.viewer-panel {display:flex;flex-direction:column;overflow:hidden}
+.viewer-heading {padding:16px 18px;border-bottom:1px solid var(--linea);flex-wrap:wrap}
+.view-buttons {display:flex;gap:3px;padding:3px;border:1px solid var(--linea);border-radius:8px;background:var(--panel-suave)}
+.view-buttons button {display:flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:6px 9px;background:transparent;border:0;border-radius:5px;color:var(--texto-2);font-size:12px}
+.view-buttons button[aria-pressed=true] {background:var(--btn-activo);color:var(--real)}
+.view-buttons button:hover:not(:disabled) {background:var(--btn-hover)}
+.viewport {position:relative;flex:1;min-height:400px;overflow:hidden;background:var(--visor-fondo)}
+.canvas-host {position:absolute;inset:0}
+.canvas-host canvas {display:block;width:100%;height:100%;touch-action:none;outline:none}
+.canvas-host canvas:focus-visible {outline:2px solid var(--real);outline-offset:-3px}
+.viewport-bottom {position:absolute;bottom:16px;left:16px;right:16px;display:flex;align-items:center;justify-content:space-between;gap:8px;pointer-events:none;z-index:1}
+.grid-toggle,.camera-tools {display:flex;align-items:center;background:var(--panel);border:1px solid var(--linea);border-radius:8px;pointer-events:auto}
+.grid-toggle {gap:8px;padding:10px 12px;font-size:12px;color:var(--texto-2)}
+.grid-toggle label {cursor:pointer}
+.camera-tools {padding:3px}
+.camera-tools button {display:flex;align-items:center;justify-content:center;width:36px;height:34px;border:0;border-radius:5px;background:transparent;color:var(--texto-2)}
+.camera-tools button:hover:not(:disabled) {background:var(--btn-hover);color:var(--real)}
+.camera-tools>span {width:1px;height:20px;background:var(--linea);margin:0 3px}
+.viewer-footer {display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px 16px;padding:12px 18px;border-top:1px solid var(--linea);font-size:11px;color:var(--texto-2)}
+.load-status {display:flex;align-items:center;gap:5px;white-space:nowrap}
+.load-status svg {color:var(--ok)}
+.touch-hint {display:none}
+.loading-layer {position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:2;background:var(--panel-suave)}
+.loading-card {width:min(360px,calc(100% - 36px));display:flex;flex-direction:column;align-items:center;padding:26px;border:1px solid var(--linea);border-radius:12px;background:var(--panel);color:var(--real)}
+.loading-card>strong {font-size:16px;color:var(--texto);margin-top:16px}
+.loading-card>span,.loading-card>small {color:var(--texto-2);margin-top:8px}
+.progress-track {width:100%;height:4px;background:var(--linea-suave);margin-top:24px;border-radius:4px;overflow:hidden}
+.progress-track>div {height:100%;background:var(--real);transition:width .25s}
+.error-card p {color:var(--texto-2);text-align:center;margin-top:12px}
+.error-card button {margin-top:16px}
+.static-preview {position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px 12px 70px;background:var(--panel-suave)}
+.static-preview img {display:block;width:100%;min-height:0;flex:1;object-fit:contain}
+.static-preview p {display:flex;gap:8px;align-items:center;max-width:560px;font-size:12px;color:var(--texto-2);padding:12px}
+.static-preview svg {flex-shrink:0}
+.spin {animation:spin 1s linear infinite}
+@keyframes spin {to{transform:rotate(360deg)}}
+@media(pointer:coarse) {.interaction-hints{display:none}.touch-hint{display:inline}}
+@media(max-width:600px) {
+  .viewer-heading {padding:14px}
+  .view-buttons {width:100%}
+  .view-buttons button {flex:1}
+  .viewport {min-height:330px}
+  .viewport-bottom {left:10px;right:10px;bottom:12px}
+  .viewer-footer {padding:10px 14px}
+}

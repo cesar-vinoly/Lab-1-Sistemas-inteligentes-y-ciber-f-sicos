@@ -1,0 +1,14 @@
+{
+  "before": {
+    "nodes": 1456,
+    "meshes": 714,
+    "primitives": 16734
+  },
+  "after": {
+    "nodes": 1456,
+    "meshes": 721,
+    "primitives": 821
+  },
+  "sourceBytes": 81805864,
+  "outputBytes": 8483688
+}

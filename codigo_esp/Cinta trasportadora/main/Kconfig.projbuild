@@ -1,0 +1,16 @@
+menu "Cinta UTEC"
+    config CINTA_WIFI_SSID
+        string "SSID Wi-Fi (2.4 GHz)"
+        default ""
+        help
+            Si queda vacio, se conserva el control local USB/Bluetooth.
+    config CINTA_WIFI_PASSWORD
+        string "Clave Wi-Fi"
+        default ""
+    config CINTA_WS_URI
+        string "Servidor WebSocket"
+        default "ws://192.168.1.150:8000/ws/esp32"
+        help
+            Cambiar la IP por la de la PC. Mantener /ws/esp32.
+            Iniciar el servidor existente con INICIAR_RED_WINDOWS.bat.
+endmenu
