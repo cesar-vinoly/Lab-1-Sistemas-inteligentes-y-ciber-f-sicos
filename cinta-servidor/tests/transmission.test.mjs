@@ -1,3 +1,8 @@
+/**
+ * Pruebas automatizadas de relaciones mecánicas, fase, tiempo de renderizado y parada.
+ * Los relojes/dispositivos simulados permiten reproducir transiciones sin hardware.
+ * Estas verificaciones no sustituyen un ensayo físico de la cinta.
+ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';

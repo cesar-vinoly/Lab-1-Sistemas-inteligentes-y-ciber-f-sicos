@@ -1,3 +1,7 @@
+/**
+ * Adaptador visual del control Checkbox de Radix. Conserva la semántica,
+ * los estados y eventos de la biblioteca y aplica las clases de la interfaz.
+ */
 "use client"
 
 import * as React from "react"

@@ -1,3 +1,9 @@
+/**
+ * Selección de materiales estructurales respetando los nombres del GLB.
+ * La protección de un ensamble se hereda por todos sus descendientes.
+ * La sustitución de referencias evita recolorear materiales compartidos con
+ * electrónica protegida; solo se liberan recursos que ya no tienen usuarios.
+ */
 import {Material, Mesh, Texture} from 'three';
 import type {Object3D} from 'three';
 
@@ -6,12 +12,15 @@ export const PROTECTED_SUPPORTS = [
   'base con driver y fan:1',
 ] as const;
 
+/* Recupera el nombre original de Onshape conservado en userData. */
 function originalName(object: Object3D): string {
   // GLTFLoader sanitizes Object3D.name (including ':' and spaces), but keeps
   // the exact GLB node name in userData.name. Do not match sanitized substrings.
   return String(object.userData.name ?? object.name).replace(/^occurrence of /, '');
 }
 
+/* Recorre primero todo el árbol y exige localizar las ramas protegidas
+ * antes de autorizar cualquier sustitución de materiales. */
 export function inspectSupports(root: Object3D) {
   const found = new Set<string>();
   const protectedNodes = new Set<Object3D>();
@@ -34,6 +43,7 @@ export function inspectSupports(root: Object3D) {
   return {found, protectedNodes, structural};
 }
 
+/* Aplica gris únicamente a mallas estructurales fuera de ramas protegidas. */
 export function applySupportMaterial(root: Object3D, gray: Material) {
   const inspection = inspectSupports(root);
   const replaced = new Set<Material>();
@@ -49,6 +59,8 @@ export function applySupportMaterial(root: Object3D, gray: Material) {
 
 // Dispose only detached resources; never dispose a material or texture still
 // used by a protected component (even through a different material instance).
+/* Libera candidatos retirados solo si ninguna malla conserva su material
+ * o textura, incluyendo los subcomponentes electrónicos. */
 export function disposeUnreferencedMaterials(root: Object3D, candidates: Set<Material>) {
   const usedMaterials = new Set<Material>();
   const usedTextures = new Set<Texture>();

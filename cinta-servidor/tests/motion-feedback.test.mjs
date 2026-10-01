@@ -1,3 +1,8 @@
+/**
+ * Pruebas automatizadas de observador visual y conciliación de encoder con estado nativo.
+ * Los relojes/dispositivos simulados permiten reproducir transiciones sin hardware.
+ * Estas verificaciones no sustituyen un ensayo físico de la cinta.
+ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';

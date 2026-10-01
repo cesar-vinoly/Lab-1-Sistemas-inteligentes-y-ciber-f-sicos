@@ -1,8 +1,16 @@
+/**
+ * Carga de acabados y proyección de texturas de engranajes y rodillos.
+ * Los mapas de color usan sRGB; los mapas de relieve representan datos lineales.
+ * La proyección se adapta al eje de cada rotor y modifica únicamente UV,
+ * conservando vértices, normales, índices y perfiles de dientes.
+ */
 import * as THREE from 'three';
 import type {RotorSpec} from './transmission';
 
 const TILE_METRES = 0.025;
 
+/* Carga las cinco texturas; si alguna falla libera las ya obtenidas.
+ * Devuelve materiales compartidos y una función de liberación. */
 export async function loadConveyorMaterials(anisotropy: number) {
   const loader = new THREE.TextureLoader();
   const files = ['blanco.jpg', 'negro.jpg', 'lija.jpg', 'base_lija.jpg', 'gris.jpg'];
@@ -43,6 +51,8 @@ export async function loadConveyorMaterials(anisotropy: number) {
 
 export type ConveyorMaterials = Awaited<ReturnType<typeof loadConveyorMaterials>>;
 
+/* Usa proyección planar en tapas y cilíndrica en laterales de cada rotor;
+ * ajusta la costura angular para evitar triángulos con textura estirada. */
 export function applyRotorMaterial(root: THREE.Object3D, spec: RotorSpec, material: THREE.MeshStandardMaterial) {
   root.updateMatrixWorld(true);
   const sample = new THREE.Vector3();

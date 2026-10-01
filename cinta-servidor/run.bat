@@ -1,4 +1,5 @@
 @echo off
+rem Inicia Node desde la carpeta del proyecto y habilita acceso por la red local.
 setlocal
 cd /d "%~dp0"
 where node >nul 2>nul

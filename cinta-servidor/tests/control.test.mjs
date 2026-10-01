@@ -1,3 +1,8 @@
+/**
+ * Pruebas automatizadas de protocolo, estado de la interfaz y coordinación WebSocket.
+ * Los relojes/dispositivos simulados permiten reproducir transiciones sin hardware.
+ * Estas verificaciones no sustituyen un ensayo físico de la cinta.
+ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -52,11 +57,11 @@ test('divergencia respeta régimen 1,5 s, persistencia 1 s, rampa, sentido y dat
   now=6500;state.ingest({...wrong,dir:'REV'});assert.equal(state.snapshot().divergence,false);
 });
 
-test('fallas alteran copias y no generan predicciones en el navegador',()=>{
+test('fallas físicas no adulteran mediciones; solo deslizamiento altera la copia visual',()=>{
   let now=0;const state=new LabState(()=>now);state.setLink(true,'first');
   state.setFault('perdida_vel',true);const original=telemetry();state.ingest(original);
-  assert.equal(original.rpm_r,35.5);assert.equal(state.raw.rpm_r,35.5);assert.equal(state.latest.rpm_r,35.5*.75);
-  state.setFault('sobrecarga',true);now=20000;state.ingest(original);assert.equal(state.latest.rpm_r,35.5*.75*.45);
+  assert.equal(original.rpm_r,35.5);assert.equal(state.raw.rpm_r,35.5);assert.equal(state.latest.rpm_r,35.5);
+  state.setFault('sobrecarga',true);now=20000;state.ingest(original);assert.equal(state.latest.rpm_r,35.5);
   state.setFault('deslizamiento',true);state.ingest({...original,pos:10});state.ingest({...original,pos:20});assert.equal(state.latest.pos,14);
   state.ingest({...original,pos:null});state.ingest({...original,pos:30});assert.equal(state.latest.pos,30);
   for(let i=0;i<20;i++){now+=200;state.ingest(original);assert.equal(state.snapshot().model,EMPTY_MODEL);assert.ok(Object.values(state.snapshot().model).every(value=>value===null));}

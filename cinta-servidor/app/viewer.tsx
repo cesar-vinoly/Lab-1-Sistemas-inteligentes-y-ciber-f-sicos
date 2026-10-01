@@ -1,3 +1,10 @@
+/**
+ * Visor Three.js integrado como componente React. Carga el ensamble GLB,
+ * materiales, luces y cámara; aplica la transformación CAD común y mantiene
+ * un único bucle de renderizado. La transmisión recibe velocidad y dirección
+ * del estado compartido; el cubo recibe POS. Al desmontar se liberan recursos
+ * GPU, listeners y decodificadores para evitar duplicación de escenas.
+ */
 'use client';
 
 import {useEffect, useLayoutEffect, useRef, useState} from 'react';
@@ -36,6 +43,7 @@ const MODELS: {id:Part;url:string}[] = [
   {id:'belt',url:'/models/correa.glb'},
 ];
 
+/* Mantiene una instancia de motor gráfico por montaje y recibe solo estado visual. */
 export default function ConveyorViewer({motion,objectPosition=null}:{motion:Motion;objectPosition?:number|null}){
   const host=useRef<HTMLDivElement>(null);
   const engine=useRef<Engine|null>(null);
@@ -55,6 +63,8 @@ export default function ConveyorViewer({motion,objectPosition=null}:{motion:Moti
     engine.current?.render();
   };
 
+  /* Aplica la velocidad antes del repintado del navegador; el frame pendiente
+   * no debe prolongar un giro después de una parada medida. */
   useLayoutEffect(()=>{
     if(status!=='ready'||!engine.current)return;
     const transmission=engine.current.transmission;
@@ -70,6 +80,7 @@ export default function ConveyorViewer({motion,objectPosition=null}:{motion:Moti
     engine.current.render();
   },[objectPosition,status]);
 
+  /* Inicialización y liberación simétricas de escena, cámara, modelos y eventos. */
   useEffect(()=>{
     const container=host.current;
     if(!container)return;
@@ -159,6 +170,8 @@ export default function ConveyorViewer({motion,objectPosition=null}:{motion:Moti
       conveyorMaterials=materials;return materials;
     });
     const ratios=Object.fromEntries(MODELS.map(model=>[model.id,0])) as Record<Part,number>;
+    /* Carga una pieza con su transformación original y asigna el acabado
+     * correspondiente antes de incorporarla al grupo común del ensamble. */
     const load=async(part:Part,url:string)=>{
       const gltf=await loader.loadAsync(url,event=>{
         ratios[part]=event.total?event.loaded/event.total:0;
@@ -219,6 +232,8 @@ export default function ConveyorViewer({motion,objectPosition=null}:{motion:Moti
     // the viewer never produces a large catch-up jump. One existing render loop.
     const onVisibilityChange=()=>{transmission.resetClock();detectedObject?.resetClock();};
     document.addEventListener('visibilitychange',onVisibilityChange);
+    /* Único ciclo gráfico: integra rotación y suavizado del cubo con tiempo real,
+     * actualiza la cámara y dibuja solo cuando cambia algo. */
     renderer.setAnimationLoop(time=>{
       if(document.hidden){transmission.resetClock();detectedObject?.resetClock();return;}
       const moving=transmission.update(time);
@@ -288,6 +303,8 @@ export default function ConveyorViewer({motion,objectPosition=null}:{motion:Moti
   </section>;
 }
 
+/* Libera geometrías, materiales y texturas sin destruir acabados compartidos
+ * que se liberarán una sola vez por su propietario. */
 function disposeObject(root:THREE.Object3D,sharedMaterials=new Set<THREE.Material>()){
   const geometries=new Set<THREE.BufferGeometry>(),materials=new Set<THREE.Material>(),textures=new Set<THREE.Texture>();
   root.traverse(object=>{

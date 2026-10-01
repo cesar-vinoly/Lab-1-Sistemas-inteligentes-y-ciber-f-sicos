@@ -1,3 +1,11 @@
+/**
+ * Coordinador de comunicación y actuación. /ws/esp32 admite un dispositivo;
+ * /ws/ui distribuye el mismo estado a todos los navegadores. Cada telemetría
+ * válida pasa por calibración, observación del controlador, CSV y difusión.
+ * Las órdenes F/R/S/E/V/M conservan el protocolo ASCII del firmware.
+ * Los ACK, caducidades y sesiones impiden reintentos de movimiento obsoletos.
+ */
+import {FaultSimulation} from './faults.mjs';
 import {ConveyorController} from './pid.mjs';
 import {calibrateTelemetry} from './telemetry.mjs';
 import {performance} from 'node:perf_hooks';
@@ -6,20 +14,27 @@ import {WebSocketServer, WebSocket} from '../vendor/ws/wrapper.mjs';
 import {CONTROL, parseTelemetry, normalizeCommand, canChangeMicrostep, matchReply} from '../shared/control-protocol.mjs';
 
 // Additive transport: attaches only upgrade handling to the existing HTTP server.
+/* Adjunta WebSocket al servidor HTTP existente. options permite inyectar
+ * un reloj y un registrador CSV en pruebas sin cambiar el protocolo de la ESP. */
 export function attachControlSocket(server, options={}) {
   const clock=options.clock??(()=>performance.now());
   const controller=new ConveyorController();
   let pidDrive=null;
+  const faults=new FaultSimulation();
+  let manualBase=null,manualSent=null,manualBlocked=false,manualStopped=false;
   const timeoutMs=options.commandTimeoutMs??CONTROL.commandTimeoutMs;
   const deviceServer=new WebSocketServer({noServer:true,maxPayload:16384,perMessageDeflate:false});
   const uiServer=new WebSocketServer({noServer:true,maxPayload:4096,perMessageDeflate:false});
   let device=null, last=null, lastAt=0, session=null, lastMotionAt=-Infinity;
   let motionPollUntil=-Infinity,statusPollAt=-Infinity,statusPollPending=false;
+  /* Solicita una ventana breve de consultas STATUS rápidas después de un mando
+   * o cambio nativo; reduce la latencia visual sin cambiar el muestreo del encoder. */
   const followMotion=()=>{
     const now=clock();
     if(now>=motionPollUntil)statusPollAt=now; // Let the native 20 ms motor task run first.
     motionPollUntil=now+2*CONTROL.encoderSampleMs+250;
   };
+  /* Limita consultas de estado y evita acumular solicitudes simultáneas. */
   const pollMotion=()=>{
     const now=clock();
     if(!device||device.readyState!==WebSocket.OPEN||now>=motionPollUntil||
@@ -31,6 +46,7 @@ export function attachControlSocket(server, options={}) {
   let pending=[];
   const recentReplies=[];
   const events=[];
+  /* Evita que un cliente web lento acumule memoria indefinidamente. */
   const send=(socket,value)=>{
     if (socket.readyState!==WebSocket.OPEN) return;
     if (socket.bufferedAmount>256*1024) {socket.terminate();return;}
@@ -42,7 +58,10 @@ export function attachControlSocket(server, options={}) {
     events.push(record);if(events.length>80)events.shift();
     broadcast({type:'event',event:record});
   };
+  const publishFaults=()=>broadcast({type:'faults',state:faults.snapshot()});
   const link=()=>({type:'link',connected:Boolean(device),session});
+  /* Difunde el ciclo de vida del comando y conserva respuestas recientes
+   * para no interpretar ACK tardíos como mandos locales nuevos. */
   const result=(entry,status,response,latencyMs=null)=>{
     if(status!=='sent'){
       recentReplies.push({command:entry.command,at:clock()});
@@ -53,7 +72,11 @@ export function attachControlSocket(server, options={}) {
   };
   const cancelPending=reason=>{for(const entry of pending)result(entry,'cancelled',reason+' · '+entry.command);pending=[];};
   const publishController=()=>broadcast({type:'controller',state:controller.snapshot()});
+  /* Punto común de envío y validación. Aplica reducciones físicas en modo manual,
+   * respeta la parada prioritaria y registra el comando real que viaja a la ESP. */
   const issueCommand=(command,id,source='web',requester=null)=>{
+    const original=command;
+    if(source==='web'&&/^V\d+$/.test(command)&&!controller.enabled)command='V'+faults.command(Number(command.slice(1)),clock());
     const entry={id,command,sentAt:clock(),source};
     const reject=reason=>{
       if(requester)send(requester,{type:'command',id,command,status:'rejected',response:reason,latencyMs:null,source});
@@ -64,12 +87,26 @@ export function attachControlSocket(server, options={}) {
     if(source==='web'&&controller.enabled&&!['F','R','S','E','STATUS'].includes(command))return reject('Desactivá el PID para cambiar velocidad o micropaso manualmente.');
     if(command.startsWith('M')&&(!canChangeMicrostep(last,clock()-lastAt)||lastAt<lastMotionAt||pending.some(item=>['F','R'].includes(item.command))))return reject('El micropaso solo cambia con telemetría reciente y el motor detenido.');
     if(command==='E'||command==='S'){
+      manualBlocked=true;manualStopped=true;
       cancelPending('Orden sustituida por '+command);
     }
     if(pending.length>=32)return reject('Hay demasiadas órdenes sin confirmar.');
+    if(source==='web'&&!controller.enabled){
+      if(/^V\d+$/.test(original)){manualBase=Number(original.slice(1));manualBlocked=false;if(manualBase===0)manualStopped=true;}
+      if(command==='F'||command==='R'){
+        manualBlocked=false;manualStopped=false;manualBase??=last?.v??50;
+        const value=faults.command(manualBase,clock());
+        if(value!==(manualSent??last?.v)&&!issueCommand('V'+value,randomUUID(),'fault',requester))return false;
+      }
+    }
+    if(/^V\d+$/.test(command))manualSent=Number(command.slice(1));
+    if(source==='web'&&controller.enabled&&['F','R'].includes(command)){
+      const cap=faults.command(100,clock());
+      if(cap<(manualSent??last?.v??100)&&!issueCommand('V'+cap,randomUUID(),'pid',requester))return false;
+    }
     pending.push(entry);
     if(['F','R','S','E'].includes(command))lastMotionAt=entry.sentAt;
-    if(source==='web'&&command!=='STATUS'&&/^[FRSEV]/.test(command)){
+    if((source==='web'||source==='fault')&&command!=='STATUS'&&/^[FRSEV]/.test(command)){
       controller.manual(command,clock());if(controller.enabled)pidDrive=null;publishController();
     }
     result(entry,'sent','Enviado '+command+'; esperando respuesta');
@@ -77,11 +114,14 @@ export function attachControlSocket(server, options={}) {
       if(!error)return;
       pending=pending.filter(item=>item!==entry);result(entry,'rejected','No se pudo enviar '+command);
       if(source==='pid')failPid('No se pudo enviar el comando PID.');
+      if(source==='fault')manualBlocked=true;
     });
     if(/^[FRSEV]/.test(command))followMotion();
     if(source!=='pid')event('Enviado '+command,'cmd');
     return true;
   };
+  /* Pausa una salida no confiable y solicita paro inmediato; enabled permanece
+   * activo para conservar la decisión del usuario. */
   const failPid=(reason,waitFor='telemetry')=>{
     if(!controller.enabled||controller.waitFor)return;
     controller.pause(clock(),reason,waitFor);pidDrive=0;
@@ -89,6 +129,8 @@ export function attachControlSocket(server, options={}) {
     if(device)issueCommand('E',randomUUID(),'pid');
     publishController();event(reason,'alarma');
   };
+  /* Traduce el porcentaje con signo a V y F/R, o S si es cero.
+   * No reenvía órdenes cuando la salida aplicada no ha cambiado. */
   const drivePid=output=>{
     if(output===pidDrive)return true;
     const previous=pidDrive;
@@ -104,7 +146,15 @@ export function attachControlSocket(server, options={}) {
     }
     pidDrive=output;return true;
   };
+  /* Actualiza límites de falla, actuación manual y ciclo PID en un único punto.
+   * Solo actúa con información y confirmaciones compatibles con el estado actual. */
   const pump=()=>{
+    controller.setSpeedLimit(faults.command(100,clock()));
+    if(!controller.enabled&&!manualBlocked&&!manualStopped&&device&&last&&clock()-lastAt<=CONTROL.staleMs&&
+      last.dir!=='STOP'&&last.rpm_m>0&&manualBase!==null&&!pending.some(entry=>entry.command!=='STATUS')){
+      const value=faults.command(manualBase,clock());
+      if(value!==(manualSent??last.v))issueCommand('V'+value,randomUUID(),'fault');
+    }
     const next=controller.tick(clock(),!pending.some(entry=>entry.command!=='STATUS'));
     if(next?.fault){failPid(next.fault,next.waitFor);return;}
     if(next&&Object.hasOwn(next,'output')){
@@ -112,6 +162,8 @@ export function attachControlSocket(server, options={}) {
       if(!drivePid(next.output)){failPid('No se pudo aplicar la salida PID.');return;}
     }
   };
+  /* Procesa configurar/activar/desactivar y responde al cliente solicitante;
+   * los estados resultantes se comparten con todos los navegadores. */
   const handlePid=(socket,message)=>{
     const reply=(status,response)=>send(socket,{type:'pid-result',id:message.id,status,response});
     try{
@@ -122,7 +174,7 @@ export function attachControlSocket(server, options={}) {
         controller.enable(clock());pidDrive=null;pump();
       }else if(message.action==='disable'){
         if(controller.enabled){
-          controller.disable(clock());pidDrive=null;
+          controller.disable(clock());pidDrive=null;manualBase=last?.v??50;manualSent=manualBase;
           if(device)issueCommand('S',randomUUID(),'web');
         }
       }else throw Error('Acción PID inválida.');
@@ -131,6 +183,8 @@ export function attachControlSocket(server, options={}) {
     }catch(error){reply('rejected',error.message);}
   };
   const rejectUpgrade=(socket,status,text)=>{socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\n\r\n`);};
+  /* Acepta exclusivamente las rutas WebSocket previstas, verifica el origen
+   * cuando está presente y rechaza una segunda ESP32 simultánea. */
   const upgrade=(request,socket,head)=>{
     let url;
     try {url=new URL(request.url,'http://localhost');} catch {rejectUpgrade(socket,400,'Bad Request');return;}
@@ -147,10 +201,12 @@ export function attachControlSocket(server, options={}) {
   };
   server.on('upgrade',upgrade);
 
+  /* Inicia una nueva sesión de dispositivo y consulta STATUS sin reproducir
+   * órdenes guardadas. Cada línea recibida es telemetría, respuesta o diagnóstico. */
   deviceServer.on('connection',socket=>{
     device=socket;last=null;lastAt=0;lastMotionAt=-Infinity;session=randomUUID();
     motionPollUntil=-Infinity;statusPollAt=-Infinity;statusPollPending=false;
-    controller.reset(clock());pidDrive=null;
+    controller.reset(clock());pidDrive=null;manualBase=null;manualSent=null;manualBlocked=false;manualStopped=false;faults.reset();publishFaults();
     recentReplies.length=0;
     socket.isAlive=true;socket.on('pong',()=>{socket.isAlive=true;});
     broadcast(link());publishController();event('ESP32 conectada','ok');
@@ -161,9 +217,18 @@ export function attachControlSocket(server, options={}) {
       if(binary){event('La ESP32 envió una trama binaria; se espera texto.','alarma');return;}
       for(const line of bytes.toString('utf8').split(/\r?\n/).map(line=>line.trim()).filter(Boolean)) {
         const telemetry=calibrateTelemetry(parseTelemetry(line));
+        /* Secuencia de adquisición: calibración ya aplicada, observación del controlador,
+         * registro CSV y difusión del mismo par medición/modelo; después se evalúa actuar. */
         if(telemetry){
           statusPollPending=false;
           if(telemetry.state==='RAMP'||last&&(telemetry.dir!==last.dir||telemetry.rpm_m!==last.rpm_m))followMotion();
+          if(!controller.enabled){
+            manualBase??=telemetry.v;
+            if(clock()-controller.motion.commandAt>=500&&!pending.some(entry=>entry.command!=='STATUS')&&telemetry.state!=='RAMP')manualStopped=telemetry.dir==='STOP';
+            if(clock()-controller.motion.commandAt>=500&&!pending.some(entry=>entry.command!=='STATUS')&&telemetry.v!==manualSent){
+              manualBase=telemetry.v;manualSent=telemetry.v;
+            }
+          }
           last=telemetry;lastAt=clock();
           controller.observe(telemetry,lastAt);
           // A local change takes priority. During a native reversal/stop ramp
@@ -176,7 +241,9 @@ export function attachControlSocket(server, options={}) {
               pidDrive=null;
             }else if(pidDrive!==0&&telemetry.v!==Math.abs(pidDrive))pidDrive=null;
           }
-          broadcast({type:'telemetry',data:telemetry,model:controller.lastModel,controller:controller.snapshot(),at:Date.now(),timeMs:lastAt,session});
+          const frame={type:'telemetry',data:telemetry,model:controller.lastModel,controller:controller.snapshot(),at:Date.now(),timeMs:lastAt,session};
+          options.speedCsv?.record(frame);
+          broadcast(frame);
           const requests=pending.filter(entry=>entry.command==='STATUS');
           pending=pending.filter(entry=>entry.command!=='STATUS');
           // A streaming telemetry frame has no request ID, so it cannot give
@@ -189,6 +256,7 @@ export function attachControlSocket(server, options={}) {
           const [entry]=pending.splice(index,1);
           const status=matchReply(entry.command,line);
           result(entry,status,'ESP32: '+line,clock()-entry.sentAt);
+          if(entry.source==='fault'&&status==='rejected')manualBlocked=true;
           if(entry.source==='pid'&&status==='rejected')failPid('La ESP32 rechazó el comando PID.');
         } else if(recentReplies.some(entry=>clock()-entry.at<=2*timeoutMs&&matchReply(entry.command,line)!==null)){
           // Native replies have no IDs. Ignore late/duplicate acknowledgments
@@ -206,20 +274,31 @@ export function attachControlSocket(server, options={}) {
     socket.on('close',()=>{
       if(device!==socket)return;
       device=null;last=null;lastAt=0;
-      controller.reset(clock());pidDrive=null;
+      controller.reset(clock());pidDrive=null;manualBase=null;manualSent=null;manualBlocked=false;manualStopped=false;faults.reset();publishFaults();
       cancelPending('Enlace cerrado, orden sin confirmar');
       broadcast(link());publishController();event('ESP32 desconectada','alarma');
     });
   });
 
+  /* Entrega snapshot a clientes nuevos y recibe solicitudes de mando, PID y fallas.
+   * La simulación es compartida por el servidor, no un estado aislado por pestaña. */
   uiServer.on('connection',socket=>{
     socket.isAlive=true;socket.on('pong',()=>{socket.isAlive=true;});
     controller.advance(clock());
-    send(socket,{type:'snapshot',link:link(),events,clockMs:clock(),controller:controller.snapshot(),last:last?{data:last,model:controller.lastModel,timeMs:lastAt,ageMs:clock()-lastAt,session}:null});
+    send(socket,{type:'snapshot',link:link(),events,clockMs:clock(),faults:faults.snapshot(),controller:controller.snapshot(),last:last?{data:last,model:controller.lastModel,timeMs:lastAt,ageMs:clock()-lastAt,session}:null});
     socket.on('message',(bytes,binary)=>{
       let message;
       try {message=JSON.parse(bytes.toString('utf8'));} catch {return;}
       if(binary||!message||typeof message.id!=='string'||!(/^[\w-]{1,80}$/).test(message.id))return;
+      if(message.type==='fault'){
+        try{
+          if(!device||!last||clock()-lastAt>CONTROL.staleMs)throw Error('La simulación requiere telemetría reciente.');
+          faults.set(message.key,message.enabled,clock());manualBlocked=false;
+          publishFaults();pump();
+          send(socket,{type:'fault-result',id:message.id,status:'ack',response:'Simulación actualizada.'});
+        }catch(error){send(socket,{type:'fault-result',id:message.id,status:'rejected',response:error.message});}
+        return;
+      }
       if(message.type==='pid'){handlePid(socket,message);return;}
       if(message.type!=='command')return;
       const command=normalizeCommand(message.command);
@@ -229,11 +308,14 @@ export function attachControlSocket(server, options={}) {
     socket.on('error',()=>{});
   });
 
+  /* Ciclo de servicio de 25 ms: caducidades de comandos, control y consultas
+   * de movimiento. El PID conserva su propio período de muestreo configurable. */
   const timer=setInterval(()=>{
     const expired=pending.filter(entry=>clock()-entry.sentAt>=timeoutMs);
     pending=pending.filter(entry=>clock()-entry.sentAt<timeoutMs);
     for(const entry of expired){
       result(entry,'timeout','Sin respuesta para '+entry.command+'; no se reenvía');
+      if(entry.source==='fault')manualBlocked=true;
       if(entry.source==='pid'){
         if(entry.command==='E')device?.terminate();
         else failPid('La ESP32 no confirmó la salida PID.');
@@ -241,6 +323,7 @@ export function attachControlSocket(server, options={}) {
     }
     pump();pollMotion();
   },25);
+  /* Verifica vida de ambos canales mediante ping/pong y cierra enlaces caídos. */
   const heartbeat=setInterval(()=>{
     for(const socket of [...deviceServer.clients,...uiServer.clients]){
       if(!socket.isAlive){socket.terminate();continue;}

@@ -1,3 +1,24 @@
+/**
+ * Firmware de adquisición y actuación de la cinta transportadora.
+ *
+ * Arquitectura:
+ * - control_task es el único escritor del estado machine y ejecuta mandos,
+ *   rampas y mediciones. Publica snapshot para pantalla y otros consumidores.
+ * - Las ISR solo capturan pulsos/tiempos o conmutan STEP; no realizan I/O de red.
+ * - serial_tx_task y network_task vacían colas de salida para que un enlace
+ *   lento no bloquee el control. oled_task dibuja una copia coherente del estado.
+ * - El PID y G(s) se ejecutan en el servidor. Este firmware recibe comandos
+ *   porcentuales y devuelve mediciones físicas, referencias y estado nativo.
+ *
+ * Unidades: RPM para motor/rodillo, cm y cm/s para posición/velocidad,
+ * Hz para STEP y microsegundos para captura de pulsos y eco ultrasónico.
+ * Sentido del encoder: la entrada es de un canal; informa magnitud de giro.
+ * DIR describe el sentido actuado por el motor, no una medición en cuadratura.
+ *
+ * Calibración: la OLED muestra POS calculada aquí con hc_offset. El servidor
+ * puede aplicar su propia corrección adicional de POS; DIST permanece bruta.
+ * Este archivo no implementa botones GPIO ni un modelo matemático de la planta.
+ */
 /*
  * CINTA UTEC -- C nativo / ESP-IDF, target esp32 (ESP32-WROOM-32D).
  * Referencia funcional: cinta_utec.ino suministrado por el usuario.
@@ -68,6 +89,8 @@
 #error "Aplicar sdkconfig.cinta.defaults: se debe conservar Bluetooth SPP."
 #endif
 
+/* Asignación física de pines del prototipo: STEP/DIR/EN y MS1/MS2 para
+ * driver; encoder y HC-SR04 como entradas; I2C para pantalla. No se reasignan GPIO. */
 #define STEP_PIN 25
 #define DIR_PIN 26
 #define EN_PIN 27
@@ -78,6 +101,8 @@
 #define ECHO_PIN 19
 #define SDA_PIN 21
 #define SCL_PIN 22
+/* Constantes mecánicas y límites operativos. El engranaje intermedio de
+ * 19 dientes invierte sentido, pero la relación de magnitudes total es 19/40. */
 #define MOTOR_STEPS 200
 #define MOTOR_GEAR_TEETH 19.0f
 #define IDLER_GEAR_TEETH 19.0f
@@ -92,6 +117,8 @@
 #define DIVERGENCE_MARGIN_MS 500U
 #define ENCODER_STOP_TIMEOUT_US 2000000U
 #define ENCODER_MIN_GAP_US 500U
+/* Períodos independientes: adquirir encoder, adquirir distancia, refrescar
+ * pantalla y transmitir WS no significa que todos los sensores actualicen a 250 ms. */
 #define ENCODER_SAMPLE_MS 1000U
 #define HC_SAMPLE_MS 100U
 #define HC_TIMEOUT_US 10000U
@@ -116,6 +143,8 @@
 
 typedef enum { STOPPED=0, FORWARD=1, REVERSE=-1 } direction_t;
 typedef enum { SRC_USB=0, SRC_BT=1, SRC_WS=2, SRC_NONE=3 } source_t;
+/* Estado de máquina: requested es el sentido solicitado y actual el
+ * ejecutado durante la rampa. owner identifica quién mantiene el mando. */
 typedef struct {
     direction_t requested, actual;
     source_t owner;
@@ -127,6 +156,8 @@ typedef struct {
     uint32_t regime_since;
 } machine_t;
 
+/* Una orden lleva origen, generación de conexión y secuencia para
+ * rechazar órdenes antiguas después de reconexiones o una emergencia. */
 typedef struct {
     source_t source;
     uint32_t epoch, sequence;
@@ -144,6 +175,8 @@ typedef struct {
     bool discard;
 } stream_t;
 
+/* Estado mutable restringido a control_task. Los lectores concurrentes
+ * usan snapshot y los recursos de comunicación se protegen con mutex propios. */
 static machine_t machine={.owner=SRC_NONE,.percent=50,.microsteps=8,
                           .hc_offset=4.0f,.first_hc=true};
 static machine_t snapshot;
@@ -173,29 +206,44 @@ static volatile uint32_t echo_start_us, echo_rise_us, echo_duration;
 static i2c_master_dev_handle_t oled;
 static uint8_t oled_frame[1025]; /* control 0x40 + 128x64/8 bytes */
 
+/** Reloj monotónico en milisegundos. Las diferencias unsigned toleran el
+ * desbordamiento del contador para los intervalos cortos usados en el control. */
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time()/1000); }
+/** Reloj en microsegundos para temporizar encoder y eco; se conserva en 32 bits. */
 static uint32_t now_us(void) { return (uint32_t)esp_timer_get_time(); }
+/** Convierte milisegundos a ticks de FreeRTOS garantizando al menos un tick. */
 static TickType_t ticks(unsigned ms) { TickType_t n=pdMS_TO_TICKS(ms); return n?n:1; }
+/** Obtiene una copia atómica del estado de conectividad; no retiene el mutex
+ * durante llamadas lentas a las bibliotecas de comunicación. */
 static links_t get_links(void)
 {
     portENTER_CRITICAL(&link_mux); links_t copy=links; portEXIT_CRITICAL(&link_mux);
     return copy;
 }
+/** Lee la última imagen coherente de la máquina para consumidores externos
+ * a la tarea de control, en particular la pantalla OLED. */
 static machine_t get_snapshot(void)
 {
     portENTER_CRITICAL(&state_mux); machine_t copy=snapshot; portEXIT_CRITICAL(&state_mux);
     return copy;
 }
+/** Publica machine bajo sección crítica; la tarea de control sigue siendo
+ * su único escritor operativo. */
 static void publish_snapshot(void)
 {
     portENTER_CRITICAL(&state_mux); snapshot=machine; portEXIT_CRITICAL(&state_mux);
 }
+/** Traduce el sentido interno al vocabulario ASCII del protocolo compartido. */
 static const char *direction_name(direction_t dir)
 {
     return dir==FORWARD?"FWD":dir==REVERSE?"REV":"STOP";
 }
 
 /* ---------- Un solo formato de telemetria, igual al Arduino ---------- */
+/** Serializa una única trama común a USB, Bluetooth y WebSocket.
+ * RPM_M es la velocidad comandada tras la rampa; RPM_T/VEL_T son referencias
+ * geométricas; RPM_R/VEL_R provienen del encoder. POS=NA invalida la detección
+ * aunque DIST conserve el último valor. STATE prioriza DIVERG, luego RAMP. */
 static void format_telemetry(const machine_t *s, char out[LINE_SIZE])
 {
     char position[24];
@@ -210,6 +258,9 @@ static void format_telemetry(const machine_t *s, char out[LINE_SIZE])
         position,(double)s->error,
         s->divergence?"DIVERG":(!s->in_regime&&s->actual!=STOPPED)?"RAMP":"OK");
 }
+/** Encola texto con terminación CR/LF y generación de conexión.
+ * El envío no espera espacio: una cola llena puede descartar la línea para
+ * preservar el tiempo de control, sin detener motor o sensores. */
 static void queue_line(QueueHandle_t queue, const char *text, uint32_t epoch)
 {
     tx_line_t line={.epoch=epoch};
@@ -217,6 +268,8 @@ static void queue_line(QueueHandle_t queue, const char *text, uint32_t epoch)
     /* Nunca esperar una salida lenta desde la tarea de control. */
     (void)xQueueSend(queue,&line,0);
 }
+/** Distribuye una respuesta o medición a transportes locales y/o remotos.
+ * La generación epoch impide enviar a una conexión nueva datos de la anterior. */
 static void emit_line(const char *text, bool local, bool remote)
 {
     links_t l=get_links();
@@ -228,6 +281,8 @@ static void emit_line(const char *text, bool local, bool remote)
 }
 
 /* ---------- STEP por GPTimer y encoder/eco por interrupcion ---------- */
+/** ISR del GPTimer: alterna STEP en cada medio período. Dos alarmas forman
+ * un pulso completo, por lo que la frecuencia del temporizador es 2·step_rate. */
 static bool IRAM_ATTR step_alarm(gptimer_handle_t timer,
                                 const gptimer_alarm_event_data_t *event,void *arg)
 {
@@ -237,6 +292,8 @@ static bool IRAM_ATTR step_alarm(gptimer_handle_t timer,
     portEXIT_CRITICAL_ISR(&step_mux);
     return false;
 }
+/** Inhibe STEP y lo fuerza a nivel bajo antes de detener el temporizador.
+ * Se utiliza para parada y para evitar pulsos durante cambios de dirección. */
 static void stop_steps(void)
 {
     portENTER_CRITICAL(&step_mux);
@@ -245,6 +302,9 @@ static void stop_steps(void)
     if(timer_running) { ESP_ERROR_CHECK(gptimer_stop(step_timer));timer_running=false; }
     last_step_rate=-1.0f;
 }
+/** Convierte la frecuencia de pasos en ticks de medio período del GPTimer
+ * de 10 MHz. Evita reconfigurar si la diferencia es menor a 1 Hz; una
+ * frecuencia inferior a 0,5 Hz detiene la generación. */
 static void apply_step_rate(float rate)
 {
     if(rate<0.5f) { stop_steps();return; }
@@ -261,16 +321,22 @@ static void apply_step_rate(float rate)
         ESP_ERROR_CHECK(gptimer_start(step_timer));timer_running=true;
     }
 }
+/** Escribe DIR según el sentido actuado. La inversión se solicita solo
+ * después de que update_motor lleve la rampa anterior a cero. */
 static void apply_direction(void)
 {
     if(machine.actual!=STOPPED) gpio_set_level(DIR_PIN,machine.actual==FORWARD);
 }
+/** Aplica la tabla MS1/MS2 del driver: 2, 4, 8 o 16 micropasos.
+ * La validación de motor detenido se realiza en el intérprete de comandos. */
 static void configure_microsteps(int value)
 {
     gpio_set_level(MS1_PIN,value==2||value==16);
     gpio_set_level(MS2_PIN,value==4||value==16);
     machine.microsteps=value;
 }
+/** Cuenta flancos ascendentes del encoder del rodillo. Rechaza flancos
+ * separados menos de 500 us para reducir pulsos espurios; no calcula RPM en ISR. */
 static void IRAM_ATTR encoder_isr(void *arg)
 {
     (void)arg;
@@ -281,6 +347,8 @@ static void IRAM_ATTR encoder_isr(void *arg)
     }
     portEXIT_CRITICAL_ISR(&encoder_mux);
 }
+/** Captura los flancos ascendente y descendente de ECHO durante la ventana
+ * de espera. Solo publica la duración; la conversión a distancia ocurre en tarea. */
 static void IRAM_ATTR echo_isr(void *arg)
 {
     (void)arg;
@@ -295,6 +363,8 @@ static void IRAM_ATTR echo_isr(void *arg)
     }
     portEXIT_CRITICAL_ISR(&echo_mux);
 }
+/** Inicializa GPTimer, entradas de encoder/eco e interrupciones.
+ * Selecciona 1/8 de micropaso y habilita el driver con EN activo en bajo. */
 static void control_hardware_init(void)
 {
     gptimer_config_t config={.clk_src=GPTIMER_CLK_SRC_DEFAULT,
@@ -316,6 +386,10 @@ static void control_hardware_init(void)
 }
 
 /* ---------- Misma rampa, M/T, filtro y criterio de divergencia ---------- */
+/** Actualiza la rampa con dt real en segundos: acelera a 120 RPM/s y
+ * desacelera a 300 RPM/s. Para invertir, primero frena hasta cero.
+ * Calcula rodillo teórico = motor·19/40, velocidad = RPM·pi·diámetro/60
+ * y frecuencia STEP = RPM_motor·200·microsteps/60. */
 static void update_motor(float dt,uint32_t current)
 {
     if(machine.actual==STOPPED&&machine.requested!=STOPPED&&machine.motor_rpm<0.1f) {
@@ -344,6 +418,10 @@ static void update_motor(float dt,uint32_t current)
     machine.step_rate=machine.motor_rpm*MOTOR_STEPS*machine.microsteps/60.0f;
     apply_step_rate(machine.step_rate);
 }
+/** Estima RPM del rodillo usando pulsos/20 y el intervalo entre referencias
+ * de flanco. La primera referencia establece el origen temporal; sin pulsos
+ * por más de 2 s declara cero. Convierte a cm/s con diámetro 2,95 cm.
+ * ERR compara RPM real y teórica, sin usar el modelo G(s) del servidor. */
 static void encoder_measurement(uint32_t pulses,uint32_t last_us,uint32_t current_us)
 {
     if(pulses>0) {
@@ -359,6 +437,8 @@ static void encoder_measurement(uint32_t pulses,uint32_t last_us,uint32_t curren
     machine.error=machine.roller_theory>1.0f?
         fabsf(machine.roller_real-machine.roller_theory)/machine.roller_theory*100.0f:0;
 }
+/** Extrae y reinicia el contador de pulsos en una sección crítica breve.
+ * El cálculo posterior se ejecuta fuera de la ISR y del bloqueo. */
 static void update_encoder(void)
 {
     portENTER_CRITICAL(&encoder_mux);
@@ -366,6 +446,9 @@ static void update_encoder(void)
     portEXIT_CRITICAL(&encoder_mux);
     encoder_measurement(count,last,now_us());
 }
+/** Convierte duración de eco en distancia: d = duración·0,0343/2, en cm.
+ * Resta hc_offset, limita POS a 0..45 cm y aplica filtro exponencial alfa 0,35.
+ * Eco ausente o fuera de ventana invalida POS sin sobrescribirlo con cero. */
 static void hc_measurement(uint32_t duration)
 {
     if(!duration) { machine.hc_valid=false;return; }
@@ -377,6 +460,8 @@ static void hc_measurement(uint32_t duration)
         machine.hc_valid=true;
     } else machine.hc_valid=false;
 }
+/** Gestiona recepción/timeout sin espera activa del eco y dispara TRIG
+ * cada 100 ms. Solo el pulso TRIG usa retardos de 2 y 10 microsegundos. */
 static void update_hc(uint32_t current,uint32_t *last_sample)
 {
     bool complete=false;uint32_t duration=0,us=now_us();
@@ -395,6 +480,9 @@ static void update_hc(uint32_t current,uint32_t *last_sample)
     gpio_set_level(TRIG_PIN,0);esp_rom_delay_us(2);
     gpio_set_level(TRIG_PIN,1);esp_rom_delay_us(10);gpio_set_level(TRIG_PIN,0);
 }
+/** Activa divergencia si RPM teórica supera 5, el motor está en régimen,
+ * transcurrieron 1500 ms de estabilización y el error supera 15 %.
+ * Este criterio local es independiente de la persistencia adicional de la web. */
 static void update_divergence(uint32_t current)
 {
     machine.divergence=machine.roller_theory>5.0f&&machine.in_regime&&
@@ -403,6 +491,8 @@ static void update_divergence(uint32_t current)
 }
 
 /* ---------- Un unico interprete: UART, SPP y WS ---------- */
+/** Valida que un comando pendiente pertenezca a la sesión WS/BT vigente.
+ * Los comandos USB no dependen de una sesión de red. */
 static bool command_live(const command_t *command)
 {
     links_t l=get_links();
@@ -410,6 +500,8 @@ static bool command_live(const command_t *command)
     if(command->source==SRC_BT)return l.bt_handle&&command->epoch==l.bt_epoch;
     return true;
 }
+/** Normaliza el texto y asigna número de secuencia. E usa una ranura urgente
+ * por transporte, de modo que el paro inmediato no dependa de la cola normal. */
 static void submit_command(source_t source,uint32_t epoch,const char *input)
 {
     command_t command={.source=source,.epoch=epoch};
@@ -426,6 +518,8 @@ static void submit_command(source_t source,uint32_t epoch,const char *input)
     if(!strcmp(command.text,"E"))return; /* E no depende de espacio en la cola. */
     if(xQueueSend(commands,&command,0)!=pdTRUE)emit_line("Error: cola de comandos llena",true,true);
 }
+/** Reconstruye líneas ASCII fragmentadas por transporte. Descarta caracteres
+ * no imprimibles o entradas demasiado largas; finish fuerza cierre de mensaje WS. */
 static void stream_feed(source_t source,uint32_t epoch,const char *data,size_t length,bool finish)
 {
     for(size_t i=0;i<length+(finish?1U:0U);i++) {
@@ -448,6 +542,8 @@ static void stream_feed(source_t source,uint32_t epoch,const char *data,size_t l
         if(ready[0])submit_command(source,epoch,ready);
     }
 }
+/** Acepta la línea parcial de USB o Bluetooth tras 120 ms sin caracteres.
+ * WebSocket delimita sus propios mensajes y no utiliza este timeout. */
 static void stream_timeouts(uint32_t current)
 {
     for(source_t source=SRC_USB;source<=SRC_BT;source++) {
@@ -464,11 +560,16 @@ static void stream_timeouts(uint32_t current)
         if(ready[0])submit_command(source,epoch,ready);
     }
 }
+/** Valida un argumento decimal completo; rechaza sufijos y desbordamiento. */
 static bool integer_arg(const char *s,long *value)
 {
     char *end;errno=0;*value=strtol(s,&end,10);
     return end!=s&&*end=='\0'&&errno==0;
 }
+/** Intérprete único de F/R (sentido), S (parada con rampa), E (inmediata),
+ * V0..100 (porcentaje), M2/4/8/16 (micropaso detenido), O (offset ultrasónico)
+ * y STATUS (telemetría). Devuelve las respuestas que reconoce el servidor.
+ * Las órdenes positivas V cambian velocidad; por sí solas no arrancan desde STOP. */
 static void process_command(const command_t *command)
 {
     const char *cmd=command->text;char reply[LINE_SIZE];long value;
@@ -508,6 +609,8 @@ static void process_command(const command_t *command)
     else strcpy(reply,"Comando invalido");
     publish_snapshot();emit_line(reply,true,true);
 }
+/** Ante pérdida remota solicita parada con rampa únicamente si el mando
+ * vigente pertenece a WS. La operación iniciada por USB/BT conserva control local. */
 static void handle_remote_loss(void)
 {
     portENTER_CRITICAL(&link_mux);bool lost=links.remote_lost;links.remote_lost=false;portEXIT_CRITICAL(&link_mux);
@@ -516,6 +619,11 @@ static void handle_remote_loss(void)
         emit_line("Enlace WS perdido: STOP; control local disponible",true,false);
     }
 }
+/** Planificador cooperativo de la máquina sobre FreeRTOS. Lee USB y procesa
+ * primero paros urgentes; descarta órdenes anteriores a la barrera de emergencia.
+ * Atiende hasta ocho órdenes normales por vuelta, motor cada 20 ms, encoder
+ * cada 1000 ms y HC cada 100 ms. Publica OLED y telemetría desde el mismo estado.
+ * USB/BT transmiten cada 1000 ms; WS cada 250 ms. Cede CPU al final de cada vuelta. */
 static void control_task(void *arg)
 {
     (void)arg;control_hardware_init();publish_snapshot();
@@ -587,6 +695,8 @@ static void control_task(void *arg)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+/* Tabla de glifos ASCII: 95 caracteres, cinco columnas de bits por glifo.
+ * Se conservan datos y licencia de la fuente original. */
 static const uint8_t font5x7[95][5]={
     {0x00,0x00,0x00,0x00,0x00},
     {0x00,0x00,0x5F,0x00,0x00},
@@ -685,6 +795,8 @@ static const uint8_t font5x7[95][5]={
     {0x02,0x01,0x02,0x04,0x02},
 };
 
+/** Dibuja caracteres de la fuente 5x7 en el framebuffer por páginas de 8 bits.
+ * La escritura afecta memoria; no transmite por I2C hasta oled_flush. */
 static void oled_text(int x,int y,const char *text)
 {
     while(*text) {
@@ -701,6 +813,8 @@ static void oled_text(int x,int y,const char *text)
         x+=6;
     }
 }
+/** Selecciona el área completa de la SSD1306 y envía el framebuffer de
+ * 1024 bytes precedido por el byte de control 0x40. */
 static esp_err_t oled_flush(void)
 {
     const uint8_t address[]={0x00,0x21,0,127,0x22,0,7};
@@ -708,6 +822,8 @@ static esp_err_t oled_flush(void)
     if(result==ESP_OK)result=i2c_master_transmit(oled,oled_frame,sizeof(oled_frame),50);
     return result;
 }
+/** Inicializa bus I2C a 400 kHz y SSD1306 128x64 en dirección 0x3C;
+ * configura orientación y bomba de carga y muestra el mensaje inicial. */
 static esp_err_t oled_init(void)
 {
     i2c_master_bus_handle_t bus;
@@ -726,6 +842,9 @@ static esp_err_t oled_init(void)
     oled_text(0,8,"CINTA TRANSPORTADORA");oled_text(0,25,"ESP32 + TMC2208");
     oled_text(0,42,"Iniciando...");return oled_flush();
 }
+/** Refresca la pantalla cada 200 ms con snapshot: sentido, porcentaje,
+ * micropaso, RPM y velocidad teóricas/reales, POS, error y estado del sensor.
+ * La pantalla no calcula ni modifica consignas. */
 static void oled_task(void *arg)
 {
     (void)arg;vTaskDelay(ticks(800));TickType_t wake=xTaskGetTickCount();
@@ -751,6 +870,8 @@ static void oled_task(void *arg)
 }
 
 /* ---------- USB y Bluetooth SPP, sin Arduino ---------- */
+/** Vacía colas USB y Bluetooth fuera del control. En SPP respeta congestión
+ * y escritura pendiente; descarta tramas cuya generación ya no está conectada. */
 static void serial_tx_task(void *arg)
 {
     (void)arg;tx_line_t line;
@@ -774,6 +895,8 @@ static void serial_tx_task(void *arg)
         vTaskDelay(ticks(5));
     }
 }
+/** Atiende solicitudes de emparejamiento según la política existente del
+ * firmware; no cambia el comportamiento de autenticación original. */
 static void bt_gap(esp_bt_gap_cb_event_t event,esp_bt_gap_cb_param_t *param)
 {
     if(event==ESP_BT_GAP_PIN_REQ_EVT) {
@@ -783,6 +906,8 @@ static void bt_gap(esp_bt_gap_cb_event_t event,esp_bt_gap_cb_param_t *param)
     } else if(event==ESP_BT_GAP_CFM_REQ_EVT)
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda,false);
 }
+/** Administra el servidor SPP, una conexión activa, recepción de comandos
+ * y señales de escritura/congestión. Al cerrar incrementa la generación. */
 static void bt_event(esp_spp_cb_event_t event,esp_spp_cb_param_t *param)
 {
     switch(event) {
@@ -828,6 +953,8 @@ static void bt_event(esp_spp_cb_event_t event,esp_spp_cb_param_t *param)
     default:break;
     }
 }
+/** Inicializa Bluetooth Classic y perfil SPP nativos. Libera memoria BLE
+ * porque esta aplicación utiliza comunicación serie Classic. */
 static void bluetooth_init(void)
 {
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
@@ -847,6 +974,8 @@ static void bluetooth_init(void)
 }
 
 /* ---------- Wi-Fi y WebSocket: callbacks breves, TX en otra tarea ---------- */
+/** Invalida WS y su generación y deja una bandera para que control_task
+ * resuelva la pérdida de enlace según el propietario del mando. */
 static void remote_down(void)
 {
     portENTER_CRITICAL(&link_mux);
@@ -855,6 +984,9 @@ static void remote_down(void)
 }
 typedef struct { char text[128];size_t used;bool active,discard; } ws_message_t;
 static ws_message_t ws_message;
+/** Callback de red: gestiona sesión y reensambla mensajes de texto
+ * fragmentados con límites de tamaño. Entrega comandos al intérprete mediante
+ * cola; no acciona el motor desde el contexto de red. */
 static void websocket_event(void *arg,esp_event_base_t base,int32_t id,void *data)
 {
     (void)arg;(void)base;
@@ -887,10 +1019,13 @@ static void websocket_event(void *arg,esp_event_base_t base,int32_t id,void *dat
         }
     }
 }
+/** Reintenta asociación Wi-Fi desde un temporizador de software. */
 static void wifi_retry_callback(TimerHandle_t timer)
 {
     (void)timer;(void)esp_wifi_connect();
 }
+/** Mantiene banderas Wi-Fi, activa reintento tras desconexión y señala
+ * disponibilidad al obtener IP. La pérdida de Wi-Fi invalida también WS. */
 static void wifi_event(void *arg,esp_event_base_t base,int32_t id,void *data)
 {
     (void)arg;(void)data;
@@ -904,6 +1039,10 @@ static void wifi_event(void *arg,esp_event_base_t base,int32_t id,void *data)
         emit_line("Wi-Fi conectado",true,false);
     }
 }
+/** Configura Wi-Fi con valores de menuconfig y crea el cliente WebSocket.
+ * Espera IP antes de iniciar; la biblioteca reconecta WS cada 3 s.
+ * El bucle vacía ws_tx con espera acotada, sin bloquear la tarea de control.
+ * Si falta SSID termina esta tarea y deja disponible el control local. */
 static void network_task(void *arg)
 {
     (void)arg;
@@ -951,6 +1090,10 @@ static void network_task(void *arg)
     }
 }
 
+/** Entrada de ESP-IDF. Mantiene driver inicialmente deshabilitado, prepara
+ * UART, NVS y OLED, crea colas y eventos y arranca tareas con prioridades.
+ * Espera CONTROL_READY antes de pantalla/red; si falla la inicialización
+ * de OLED retorna antes de habilitar el control, como en el código adjunto. */
 void app_main(void)
 {
     gpio_config_t output={.pin_bit_mask=(1ULL<<STEP_PIN)|(1ULL<<DIR_PIN)|(1ULL<<EN_PIN)|

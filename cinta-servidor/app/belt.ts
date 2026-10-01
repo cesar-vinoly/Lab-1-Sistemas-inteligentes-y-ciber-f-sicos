@@ -1,3 +1,9 @@
+/**
+ * Representación del movimiento de la correa mediante desplazamiento UV.
+ * Las normales distinguen superficie exterior, interior y cantos; cada isla UV
+ * conserva su escala y fase sobre un recorrido cerrado. Se usa ds = r·dtheta
+ * del rodillo 1 sin trasladar vértices ni alterar la jerarquía CAD.
+ */
 import {MathUtils, Matrix3, Mesh, MeshStandardMaterial, MirroredRepeatWrapping, Vector3} from 'three';
 import type {Material, Object3D, Texture} from 'three';
 import type {Transmission} from './transmission';
@@ -22,6 +28,7 @@ export type BeltSurface = 'outside' | 'inside' | 'edge';
 
 // Positive s follows positive rotation about the roller's CAD +X axis:
 // upper run towards smaller Z, lower run towards larger Z.
+/* Devuelve la coordenada longitudinal sobre rectas y arcos del lazo cerrado. */
 export function beltDistance(point: Vector3): number {
   const {centerY, startZ, endZ, neutralRadius:r} = BELT_PROFILE;
   if (point.z >= startZ && point.z <= endZ) {
@@ -32,6 +39,8 @@ export function beltDistance(point: Vector3): number {
   return left ? r*angle : Math.PI*r + STRAIGHT + r*(angle-Math.PI);
 }
 
+/* Clasifica cada primitiva por su normal respecto del interior de la correa
+ * y obtiene el ajuste de sus UV originales. Rechaza superficies ambiguas. */
 function inspectSurface(mesh: Mesh) {
   const positions = mesh.geometry.getAttribute('position');
   const normals = mesh.geometry.getAttribute('normal');
@@ -67,6 +76,8 @@ function inspectSurface(mesh: Mesh) {
   return {mesh, surface, repeat, offset:s0/BELT_TILE_LENGTH-uMin*repeat};
 }
 
+/* Asigna lija exterior y respaldo interior, clona el estado de texturas
+ * por isla y conecta su desplazamiento al giro del rodillo motriz. */
 export function applyBeltMaterials(
   root: Object3D,
   finishes: {abrasive:MeshStandardMaterial; backing:MeshStandardMaterial},

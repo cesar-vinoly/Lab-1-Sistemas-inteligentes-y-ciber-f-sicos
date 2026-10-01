@@ -1,5 +1,13 @@
+/**
+ * Punto de entrada del servidor HTTP de la cinta transportadora.
+ * Sirve dist/, adjunta los canales WebSocket y abre el registro CSV.
+ * El control reside en control/websocket.mjs y control/pid.mjs; el navegador
+ * recibe estados y mediciones, pero no ejecuta el PID del sistema físico.
+ * Las rutas de archivos se resuelven respecto de este módulo, no del directorio de ejecución.
+ */
 // Servidor local sin dependencias externas. Ejecutar: node server.mjs
 import http from 'node:http';
+import {startupMessage} from './control/startup-message.mjs';
 import {createReadStream} from 'node:fs';
 import {realpath, stat} from 'node:fs/promises';
 import {extname, resolve, sep} from 'node:path';
@@ -7,7 +15,10 @@ import {fileURLToPath} from 'node:url';
 import {pipeline} from 'node:stream/promises';
 import {spawn} from 'node:child_process';
 import {attachControlSocket} from './control/websocket.mjs';
+import {createSpeedCsv} from './control/speed-csv.mjs';
 
+/* Puerto y dirección de escucha: argumentos explícitos prevalecen sobre entorno.
+ * Se conserva el alcance de red existente; el mensaje no abre nuevas interfaces. */
 let port = Number(process.env.CINTA_PORT || 8000);
 let host = process.env.CINTA_HOST || '127.0.0.1';
 let openBrowser = false;
@@ -26,6 +37,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
   process.exit(1);
 }
 
+/* Comprueba que la distribución compilada exista antes de admitir conexiones. */
 let webRoot;
 try {
   webRoot = await realpath(fileURLToPath(new URL('./dist/', import.meta.url)));
@@ -35,6 +47,7 @@ try {
   process.exit(1);
 }
 
+/* Tipos MIME necesarios para HTML, módulos, modelos GLB, imágenes y fuentes. */
 const types = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -53,12 +66,15 @@ const types = {
   '.txt': 'text/plain; charset=utf-8',
 };
 const insideRoot = path => path.startsWith(webRoot + sep);
+/* Respuesta textual uniforme; HEAD envía cabeceras pero no cuerpo. */
 function reply(res, status, message, head = false) {
   const body = Buffer.from(message + '\n', 'utf8');
   res.writeHead(status, {'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': body.length});
   res.end(head ? undefined : body);
 }
 
+/* Servidor de archivos estáticos: solo GET/HEAD y rutas contenidas en dist.
+ * realpath también impide escapar de la raíz mediante enlaces simbólicos. */
 const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'no-cache');
@@ -94,25 +110,25 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-const controlSocket = attachControlSocket(server);
+/* Inicia registro CSV asíncrono; se omite su aviso de éxito en la consola.
+ * Los errores conservan diagnóstico visible y no detienen el servicio de control. */
+let speedCsv;
+try {
+  speedCsv = await createSpeedCsv(fileURLToPath(new URL('./datos/', import.meta.url)));
+} catch (error) {
+  console.error('No se pudo iniciar el registro CSV:', error.message);
+}
+const controlSocket = attachControlSocket(server, {speedCsv});
 server.on('error', error => {
   if (error.code === 'EADDRINUSE') console.error(`El puerto ${port} esta ocupado. Proba: node server.mjs --port ${port < 65535 ? port + 1 : 8001}`);
   else console.error('No se pudo iniciar el servidor:', error.message);
+  void speedCsv?.close();
   process.exitCode = 1;
 });
 server.listen(port, host, () => {
-  const address = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
-  const url = `http://${address.includes(':') ? '[' + address + ']' : address}:${port}/`;
-  console.log(`
-========================================
-   CINTA TRANSPORTADORA - GEMELO DIGITAL
-========================================
-
-Servidor iniciado correctamente.
-
-Acceso local:
-${url}
-`);
+  // Mensaje institucional; la dirección LAN procede de las interfaces del equipo.
+  const {url,text}=startupMessage(host,port);
+  console.log(text);
   if (openBrowser) {
     const command = process.platform === 'win32' ? 'rundll32.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
     const openArgs = process.platform === 'win32' ? ['url.dll,FileProtocolHandler', url] : [url];
@@ -121,8 +137,15 @@ ${url}
     child.unref();
   }
 });
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
+/* Cierre ordenado: detiene WebSocket/HTTP y espera el vaciado del CSV.
+ * La bandera impide ejecutar dos cierres simultáneos por señales repetidas. */
+let stopping = false;
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => {
+  if (stopping) return;
+  stopping = true;
   controlSocket.close();
-  server.close(() => process.exit(0));
+  const httpClosed = new Promise(resolve => server.close(resolve));
   server.closeAllConnections();
+  await Promise.all([httpClosed, speedCsv?.close()]);
+  process.exit(0);
 });

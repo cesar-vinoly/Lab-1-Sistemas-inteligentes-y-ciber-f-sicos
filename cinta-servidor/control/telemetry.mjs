@@ -1,3 +1,8 @@
+/**
+ * Calibración de entrada aplicada una sola vez en el backend.
+ * El desplazamiento de POS es independiente de DIST y del encoder.
+ * Los valores ausentes no se convierten en cero ni en detecciones válidas.
+ */
 // Installation calibration: 6.3 cm reported by the ESP corresponds to 10 cm
 // physically. Apply only at ESP ingress; browser parsing and snapshots already
 // contain calibrated POS. DIST and encoder measurements retain their units.

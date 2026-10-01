@@ -1,3 +1,10 @@
+/**
+ * Cinemática del ensamble: engranajes 19/19/40 y rodillos solidarios.
+ * La fase del motriz se integra con deltaTime y se multiplica por cada relación.
+ * Los pivotes están en coordenadas CAD originales (metros); los grupos
+ * compensadores mantienen la posición importada al iniciar la animación.
+ * El giro del rodillo 1 notifica a la correa para desplazar sus texturas.
+ */
 import {advanceMotor} from '../shared/motor-motion.mjs';
 import {GEAR_RATIO} from '../shared/control-protocol.mjs';
 import {Group, Vector3} from 'three';
@@ -35,6 +42,8 @@ export const ROTORS: readonly RotorSpec[] = [
   {id:'encoder', file:'encoder.glb', finish:'black', pivot:[0,-0.10835,0.04], ratio:OUTPUT_RATIO},
 ];
 
+/* Encapsula la pieza con T(p)·R·T(-p), de modo que la rotación se realiza
+ * alrededor del eje mecánico sin cambiar su posición inicial CAD. */
 export function createRotor(model: Object3D, spec: RotorSpec): Group {
   const pivot = new Group();
   pivot.name = `Eje_${spec.id}`;
@@ -49,6 +58,8 @@ export function createRotor(model: Object3D, spec: RotorSpec): Group {
   return pivot;
 }
 
+/* Conserva una fase motriz común; las relaciones firmadas garantizan
+ * sincronismo entre todos los engranajes, rodillos y encoder. */
 export function createTransmission() {
   let direction: Direction = 0;
   let driveRpm = DRIVE_RPM;
@@ -62,6 +73,8 @@ export function createTransmission() {
       pivot.quaternion.setFromAxisAngle(AXIS, phase * spec.ratio);
     }
   };
+  /* Integra velocidad angular desde RPM: dtheta = RPM·2π·dt/60.
+   * Descarta tiempos antiguos y distribuye el incremento a la correa. */
   const update = (timeMs: number): boolean => {
     // A queued RAF can carry a timestamp older than the latest telemetry
     // commit. Never rewind the animation clock or replay that interval.

@@ -1,3 +1,12 @@
+/**
+ * Control de aproximación con lazo interno de velocidad y modelo independiente.
+ * DIST determina el perfil de frenado; POS valida la presencia del objeto.
+ * VEL_R, medida por el encoder, realimenta el PID. La salida es un porcentaje
+ * con signo: positivo adelante, negativo reversa y cero parada.
+ * G(s) recibe el comando aplicado y produce una predicción en cm/s; nunca
+ * sustituye el encoder ni alimenta la animación. Tiempos internos en ms;
+ * las ecuaciones de integración convierten explícitamente los intervalos a s.
+ */
 import {MotorMotion} from '../shared/motor-motion.mjs';
 import {EncoderMotion} from '../shared/encoder-motion.mjs';
 import {CONTROL,PID_DEFAULTS,PID_BASE_PERCENT,PLANT,ROLLER_CM_PER_REV,MAX_BELT_CM_S,APPROACH,validatePidConfig,validEncoder} from '../shared/control-protocol.mjs';
@@ -12,10 +21,14 @@ const emptyModel=()=>({speedCmS:null,signedSpeedCmS:null,rollerRpm:null,position
 
 // Exact zero-order-hold discretization of the supplied continuous plant.
 // x1'=x2; x2'=-8.058*x1-4.286*x2+u; y=.1425*x1+.004656*x2.
+/* Modelo continuo en espacio de estados: x1'=x2, x2'=-8.058x1-4.286x2+u.
+ * La solución exacta con entrada constante entre muestras evita depender del FPS. */
 export class PlantModel {
   x1=0;x2=0;
   reset(){this.x1=0;this.x2=0;}
   get output(){return PLANT.numerator[1]*this.x1+PLANT.numerator[0]*this.x2;}
+  /* Propaga el estado de la planta durante dt segundos con retención de orden cero.
+   * El resultado conserva el signo; su magnitud se usa en la gráfica. */
   advance(input,dt){
     if(!Number.isFinite(input)||!Number.isFinite(dt)||dt<0)throw Error('Entrada o intervalo de planta inválido.');
     if(!dt)return this.output;
@@ -32,6 +45,9 @@ export class PlantModel {
 export class VelocityPid {
   integral=0;derivative=0;filtered=null;terms={p:0,i:0,d:0};
   reset(){this.integral=0;this.derivative=0;this.filtered=null;this.terms={p:0,i:0,d:0};}
+  /* Calcula PID de velocidad normalizado por MAX_BELT_CM_S.
+   * Añade anticipación proporcional a la referencia, deriva la medición filtrada
+   * y condiciona la integral a los límites efectivos para impedir windup. */
   update(reference,measured,dt,config,lower,upper,integrate=true){
     if(![reference,measured,dt,lower,upper].every(Number.isFinite)||measured<0||reference<0||dt<=0||upper<lower)throw Error('Realimentación de velocidad o límites PID inválidos.');
     const previous=this.filtered;
@@ -61,10 +77,21 @@ export class ConveyorController {
   manualDirection=0;manualPercent=50;plant=new PlantModel();pid=new VelocityPid();lastModel=emptyModel();
   motion=new MotorMotion();trackingCommand=false;speedReferenceCmS=0;speedErrorCmS=null;remainingCm=null;
   feedback=new EncoderMotion();
+  speedLimitPercent=100;
+  /* Actualiza el límite impuesto por fallas y reinicia memoria del PID al cambiarlo.
+   * No libera un frenado por objeto ni modifica la selección enabled. */
+  setSpeedLimit(percent){
+    const next=Math.max(1,Math.min(100,percent));
+    if(next===this.speedLimitPercent)return;
+    this.speedLimitPercent=next;this.pid.reset();
+    if(!this.braking)this.profileCeiling=Infinity;
+  }
   goalLatched=false;braking=false;profileCeiling=Infinity;approachDirection=-1;encoderMissingSince=null;
   clearSince=null;clearAt=null;clearSamples=0;zoneAt=null;
   objectPresent=null;nearestDistance=null;newObject=false;
   resetClear(){this.clearSince=null;this.clearAt=null;this.clearSamples=0;}
+  /* Rearma el perfil para una nueva pieza o un despeje confirmado.
+   * Conserva el estado físico y la planta; elimina integral y error de la pieza anterior. */
   restartObject(now){
     // Clear only the previous object's control history. Keep the actual held
     // output, plant state, encoder observer, enabled selection and direction.
@@ -73,6 +100,8 @@ export class ConveyorController {
     this.nearestDistance=null;this.resetClear();this.newObject=true;
     this.lastControlAt=now-this.config.sampleMs;this.consumedAt=null;
   }
+  /* Detecta transiciones de presencia y exige muestras separadas para confirmar
+   * despeje. Una lectura NA aislada cerca del objetivo no libera la parada. */
   updateObject(now,detected){
     if(this.zoneAt===this.lastAt)return false;
     this.zoneAt=this.lastAt;
@@ -102,10 +131,14 @@ export class ConveyorController {
     this.restartObject(now);if(detected)this.nearestDistance=this.latest.dist;
     return true;
   }
+  /* Avanza G(s) con la salida aplicada durante el intervalo anterior y actualiza
+   * el seguimiento del mando. No introduce datos sintéticos en el encoder. */
   advance(now){
     if(this.modelAt!==null)this.plant.advance(this.outputPercent*this.config.inputScale,Math.max(0,now-this.modelAt)/1000);
     this.modelAt=now;this.motion.advance(now);
   }
+  /* Reinicia la sesión de telemetría sin desactivar el PID seleccionado.
+   * Mantiene las pausas manuales y espera realimentación nueva antes de actuar. */
   reset(now){
     const reason=this.waitFor==='manual'||this.waitFor==='encoder'?this.reason:
       this.enabled?'PID activo; esperando telemetría de la ESP32.':'PID desactivado.';
@@ -115,6 +148,8 @@ export class ConveyorController {
     this.feedback=new EncoderMotion();
     this.plant.reset();this.lastModel=emptyModel();this.manualDirection=0;this.manualPercent=50;this.errorCm=null;this.remainingCm=null;
   }
+  /* Valida parámetros únicamente con el PID desactivado. Si cambian unidades
+   * de entrada/salida, reinicia G(s) para no mezclar estados de escalas diferentes. */
   configure(input,now){
     if(this.enabled)throw Error('Desactivá el PID antes de cambiar su configuración.');
     const next=validatePidConfig(input,this.config);this.advance(now);
@@ -123,6 +158,8 @@ export class ConveyorController {
     this.errorCm=validFeedback(this.latest)?next.targetCm-this.latest.dist:null;
     this.remainingCm=validFeedback(this.latest)?this.latest.dist-next.targetCm:null;
   }
+  /* Incorpora la muestra física, actualiza presencia y observador visual,
+   * y obtiene un punto de G(s) emparejado con el mismo instante. */
   observe(raw,now){
     this.advance(now);this.latest={...raw};this.lastAt=now;
     this.feedback.observe(raw,now);
@@ -138,11 +175,14 @@ export class ConveyorController {
     // One model sample per real sample, at exactly the same server timestamp.
     this.lastModel=this.modelSample();
   }
+  /* Exige encoder válido y telemetría reciente; una velocidad cero es válida.
+   * La ausencia de objeto no impide activar el control. */
   enable(now){
     if(!validEncoder(this.latest)||this.lastAt===null||now-this.lastAt>CONTROL.staleMs)throw Error('El PID requiere telemetría reciente y realimentación válida del encoder.');
     this.enabled=true;
     this.resume(now,this.config.forwardIncreasesDistance?-1:1,true);
   }
+  /* Libera la pausa y reinicia el perfil de aproximación en el sentido indicado. */
   resume(now,direction=this.approachDirection,initial=false){
     this.waitFor=null;this.status='running';this.reason='PID activo; aproximación con realimentación del encoder.';
     this.goalLatched=false;this.braking=false;this.profileCeiling=Infinity;this.encoderMissingSince=null;
@@ -150,6 +190,8 @@ export class ConveyorController {
     this.approachDirection=direction;
     this.pid.reset();this.lastControlAt=initial?null:now-this.config.sampleMs;this.consumedAt=null;this.lastTickAt=now;
   }
+  /* Retiene la selección PID y pone la salida a cero. waitFor identifica si
+   * la recuperación necesita acción manual, encoder o nueva telemetría. */
   pause(now,reason,waitFor='telemetry'){
     this.advance(now);this.waitFor=this.enabled?waitFor:null;this.pausedAt=now;
     this.status=this.enabled?(waitFor==='manual'?'paused':waitFor==='encoder'?'fault':'waiting'):'manual';this.reason=reason;
@@ -158,9 +200,12 @@ export class ConveyorController {
     this.resetClear();this.zoneAt=null;
     this.lastControlAt=null;this.consumedAt=null;this.effectiveSampleMs=null;
   }
+  /* Único punto de desactivación explícita del PID por decisión del usuario. */
   disable(now){
     this.enabled=false;this.pause(now,'PID desactivado por el usuario.');
   }
+  /* Integra el mando manual: con PID activo, S/E pausan y F/R reanudan;
+   * sin PID actualiza dirección y porcentaje de la trayectoria del motor. */
   manual(command,now){
     if(this.enabled){
       if(['S','E','V0'].includes(command)){
@@ -178,11 +223,16 @@ export class ConveyorController {
     this.outputPercent=this.manualDirection*this.manualPercent;
     this.motion.target(this.outputPercent,now,command==='E',this.manualDirection);this.trackingCommand=true;
   }
+  /* Registra el porcentaje con signo aplicado al actuador; será la entrada
+   * de G(s) durante el siguiente intervalo temporal. */
   applied(output,now){
     this.advance(now);
     if(output!==this.outputPercent||this.motion.targetRpm!==output*CONTROL.maxMotorRpm/100)this.motion.target(output,now);
     this.outputPercent=output;if(output!==0)this.manualPercent=Math.abs(output);this.trackingCommand=true;
   }
+  /* Ejecuta el ciclo condicionado por muestreo, frescura y ACK pendientes.
+   * La parada por setpoint tiene prioridad; luego calcula perfil de distancia
+   * y PID de velocidad dentro del límite de falla y la rampa de salida. */
   tick(now,canSend=true){
     this.advance(now);
     let gap=this.lastTickAt===null?0:now-this.lastTickAt;this.lastTickAt=now;
@@ -199,7 +249,7 @@ export class ConveyorController {
     // the full command timeout when a valid range sample already says stop.
     if(!validEncoder(this.latest))return {fault:'PID activo; salida en espera por velocidad del encoder inválida.'};
     const objectDetected=validFeedback(this.latest);
-    const cruisePercent=PID_BASE_PERCENT;
+    const cruisePercent=Math.min(PID_BASE_PERCENT,this.speedLimitPercent);
     const cruiseSpeed=cruisePercent/100*MAX_BELT_CM_S;
     this.updateObject(now,objectDetected);
     if(this.goalLatched)return null;
@@ -217,6 +267,8 @@ export class ConveyorController {
     this.remainingCm=objectDetected?raw.dist-config.targetCm:null;
     this.speedErrorCmS=this.speedReferenceCmS-raw.vel_r;
     this.effectiveSampleMs=dt*1000;this.lastControlAt=now;this.consumedAt=this.lastAt;
+    /* Perfil de frenado: limita v para que v·T + v²/(2·a) no exceda
+     * la distancia libre. Incluye tiempo de respuesta y velocidad física actual. */
     if(objectDetected){
       const responseSeconds=Math.max(config.sampleMs/1000,dt)+APPROACH.telemetrySeconds;
       const decel=APPROACH.decelCmS2,free=Math.max(0,this.remainingCm-config.toleranceCm/2);
@@ -233,7 +285,7 @@ export class ConveyorController {
       // physical ramp remains authoritative; no second slow ramp is added.
       this.braking=false;this.profileCeiling=cruiseSpeed;
     }
-    this.speedReferenceCmS=this.profileCeiling;
+    this.speedReferenceCmS=Math.min(this.profileCeiling,cruiseSpeed);
     this.speedErrorCmS=this.speedReferenceCmS-raw.vel_r;
     const previous=Math.abs(this.outputPercent);
     const profilePercent=Math.min(config.maxPercent,this.profileCeiling/MAX_BELT_CM_S*100);
@@ -241,7 +293,7 @@ export class ConveyorController {
     // its held zero sample into an increasingly large command.
     if(raw.rpm_m>20&&raw.vel_r<0.01)this.encoderMissingSince??=now;else this.encoderMissingSince=null;
     if(this.encoderMissingSince!==null&&now-this.encoderMissingSince>2500)return {fault:'PID activo; sin giro medido por el encoder. Esperando realimentación o un mando de arranque.',waitFor:'encoder'};
-    const upper=Math.max(1,Math.min(config.maxPercent,
+    const upper=Math.max(1,Math.min(config.maxPercent,cruisePercent,
       this.braking?Math.min(profilePercent,fresh?cruisePercent:previous):cruisePercent,
       fresh?cruisePercent:previous+APPROACH.slewPercentS*dt));
     // A 1% final crawl avoids stopping short of the goal; the goal latch
@@ -253,15 +305,19 @@ export class ConveyorController {
     this.newObject=false;
     this.requestedPercent=this.approachDirection*Math.max(1,Math.floor(percent+1e-9));
     this.status=this.braking?'braking':'running';
-    this.reason=this.braking?'Reduciendo velocidad según distancia y encoder.':objectDetected?'Crucero al 100 % con realimentación del encoder.':'Sin objeto: crucero al 100 % con realimentación del encoder.';
+    this.reason=this.braking?'Reduciendo velocidad según distancia y encoder.':`Crucero al ${cruisePercent} % con realimentación del encoder.${cruisePercent<100?' Limitado por simulación de falla.':''}`;
     return {output:this.requestedPercent};
   }
+  /* Convierte la salida identificada de G(s) de RPM a cm/s y calcula
+   * error encoder menos modelo, sin sustituir ninguna curva. */
   modelSample(){
     const signedSpeedCmS=this.plant.output*this.config.outputScale,speedCmS=Math.abs(signedSpeedCmS);
     const errorCmS=this.latest?this.latest.vel_r-speedCmS:null;
     return {speedCmS,signedSpeedCmS,rollerRpm:speedCmS/ROLLER_CM_PER_REV*60,positionCm:null,errorCmS,
       errorPercent:errorCmS===null||speedCmS<0.01?null:Math.abs(errorCmS)/speedCmS*100};
   }
+  /* Estado serializable para todos los clientes: selección, salida, referencias,
+   * términos PID, modelo y realimentación visual. */
   snapshot(){return {enabled:this.enabled,status:this.status,reason:this.reason,config:{...this.config},errorCm:this.errorCm,
     outputPercent:this.outputPercent,requestedPercent:this.requestedPercent,commandPercent:this.manualPercent,effectiveSampleMs:this.effectiveSampleMs,
     terms:{...this.pid.terms},model:{...this.lastModel},

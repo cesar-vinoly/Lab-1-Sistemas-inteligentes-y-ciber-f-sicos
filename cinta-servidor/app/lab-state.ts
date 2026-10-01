@@ -1,3 +1,10 @@
+/**
+ * Estado de presentación desacoplado del transporte y del renderizador.
+ * raw conserva la telemetría recibida; latest permite una copia de posición
+ * para deslizamiento. history almacena las curvas con tiempo común.
+ * Los mandos provisionales actualizan controles, pero el giro del gemelo
+ * se obtiene de la realimentación del servidor y del estado nativo de la ESP32.
+ */
 import {CONTROL, FAULTS, canChangeMicrostep, validEncoder} from '../shared/control-protocol.mjs';
 import type {Telemetry,ControllerState,ModelSample} from '../shared/control-protocol.mjs';
 import {MotorMotion} from '../shared/motor-motion.mjs';
@@ -7,7 +14,7 @@ import type {Motion} from './transmission.ts';
 export type Fault = keyof typeof FAULTS;
 export type Sample = {at:number; speed:number|null; reference:number|null; position:number|null; modelSpeed:number|null; speedError:number|null; simulatedSpeed:number|null; simulatedPosition:number|null; divergence:boolean; simulated:boolean};
 export type DisplayTelemetry = Telemetry & {simulated:boolean};
-export type CommandResult = {type:'command'; id:string; command:string; status:string; response:string; latencyMs:number|null;source?:'web'|'pid'};
+export type CommandResult = {type:'command'; id:string; command:string; status:string; response:string; latencyMs:number|null;source?:'web'|'pid'|'fault'};
 type ControlValues = Pick<Telemetry,'dir'|'v'|'m'>;
 type ControlOverrides = {[K in keyof ControlValues]?:{id:string; value:ControlValues[K]; until:number}};
 export type SharedControl = Motion & Omit<ControlValues,'dir'> & {
@@ -44,6 +51,7 @@ export class LabState {
   private clock:()=>number;
   constructor(clock=()=>performance.now()){this.clock=clock;}
 
+  /* Invalida mediciones de la sesión anterior y agrega discontinuidad al historial. */
   private resetMeasurement(){
     this.raw=null;this.latest=null;this.lastAt=null;this.stableSince=null;this.errorSince=null;
     this.divergence=false;this.slipAnchor=null;
@@ -52,6 +60,7 @@ export class LabState {
     this.controlOverrides={};this.pending.clear();this.model=EMPTY_MODEL;this.motion=new MotorMotion();this.confirmedMotion=null;
     this.history.push({at:this.clock(),speed:null,reference:null,position:null,modelSpeed:null,speedError:null,simulatedSpeed:null,simulatedPosition:null,divergence:false,simulated:false});
   }
+  /* Concilia presencia del dispositivo y su identificador de sesión. */
   setLink(connected:boolean,session:string|null){
     if(this.session!==session || this.connected!==connected){
       this.resetMeasurement();
@@ -60,15 +69,20 @@ export class LabState {
     this.connected=connected;this.session=session;
     if(!connected)this.pending.clear();
   }
+  /* Distingue perder el servidor de perder únicamente la ESP32. */
   setBridge(connected:boolean){
     this.bridge=connected;
     if(!connected){this.setLink(false,null);this.response='Servidor desconectado. Reintentando conexión.';}
   }
+  /* Mantiene la selección confirmada por el servidor; reinicia el ancla visual
+   * si cambia la simulación de deslizamiento. */
   setFault(key:Fault,enabled:boolean){
     if(enabled===(this.faults[key]!==undefined))return;
     if(enabled)this.faults[key]=this.clock();else delete this.faults[key];
     if(key==='deslizamiento')this.slipAnchor=null;
   }
+  /* Asocia respuesta con id, administra pendientes y revierte previsiones
+   * cuando la orden falla. La latencia se calcula solo para respuestas medibles. */
   command(result:CommandResult){
     this.response=result.response;
     const sending=result.status==='queued'||result.status==='sent';
@@ -94,6 +108,7 @@ export class LabState {
       this.latencies.push(result.latencyMs);this.latencies=this.latencies.slice(-10);
     }
   }
+  /* Carga el estado de control del backend y transforma sus tiempos al reloj local. */
   setController(value:ControllerState,serverOffset=0){
     if(value.enabled&&!this.controller?.enabled)this.controlOverrides={};
     this.controller=value;
@@ -105,6 +120,7 @@ export class LabState {
       }
     }
   }
+  /* Representa una orden pendiente en los controles, sin usarla para girar el CAD. */
   private previewCommand(id:string,command:string){
     if(this.controller?.enabled&&!['F','R','S','E'].includes(command))return;
     const until=this.clock()+CONTROL.commandTimeoutMs;
@@ -127,6 +143,8 @@ export class LabState {
     if(this.confirmedMotion)this.motion.load(this.confirmedMotion,this.clock());
     else if(this.raw)this.motion.observe(this.raw,this.clock());
   }
+  /* Construye el mando único y la velocidad del visor. Datos vencidos congelan
+   * el movimiento; el signo CAD corrige la orientación respecto de FWD/REV. */
   private sharedControl(fresh:boolean,now:number):SharedControl{
     for(const key of ['dir','v','m'] as const){
       if(this.controlOverrides[key] && now>=this.controlOverrides[key]!.until){
@@ -155,6 +173,8 @@ export class LabState {
       source:Object.keys(changes).length?'command':automatic?'pid':'telemetry'};
   }
 
+  /* Añade una muestra real y su modelo al historial. La copia visual de
+   * deslizamiento no altera raw, el controlador backend ni el CSV. */
   ingest(raw:Telemetry,at=this.clock(),model:ModelOutput|null=null){
     this.model=model??EMPTY_MODEL;
     if(this.lastAt!==null && at-this.lastAt>CONTROL.staleMs){this.stableSince=null;this.errorSince=null;}
@@ -164,14 +184,7 @@ export class LabState {
     // Native state reconciles the mando; the physical feedback observer drives
     // animation independently of command previews and simulated faults.
     this.controlOverrides={};
-    const telemetry:DisplayTelemetry={...raw,simulated:Object.keys(this.faults).length>0};
-    let factor=1;
-    if(this.faults.perdida_vel!==undefined)factor*=.75;
-    if(this.faults.sobrecarga!==undefined)factor*=Math.max(.45,1-.06*Math.max(0,(at-this.faults.sobrecarga)/1000));
-    if(factor<1){
-      telemetry.rpm_r*=factor;telemetry.vel_r*=factor;
-      telemetry.err=telemetry.rpm_t===null?null:telemetry.rpm_t>1?Math.abs(telemetry.rpm_r-telemetry.rpm_t)/telemetry.rpm_t*100:0;
-    }
+    const telemetry:DisplayTelemetry={...raw,simulated:this.faults.deslizamiento!==undefined};
     if(this.faults.deslizamiento!==undefined){
       if(telemetry.pos===null)this.slipAnchor=null;
       else {this.slipAnchor??=telemetry.pos;telemetry.pos=this.slipAnchor+.4*(telemetry.pos-this.slipAnchor);}
@@ -185,11 +198,13 @@ export class LabState {
     this.divergence=next;this.latest=telemetry;
     this.history.push({at,speed:raw.vel_r,reference:raw.vel_t,position:raw.pos,
       modelSpeed:this.model.speedCmS,speedError:this.model.errorCmS,
-      simulatedSpeed:telemetry.simulated?telemetry.vel_r:null,simulatedPosition:telemetry.simulated?telemetry.pos:null,
+      simulatedSpeed:null,simulatedPosition:telemetry.simulated?telemetry.pos:null,
       divergence:next,simulated:telemetry.simulated});
     this.prune(at);
   }
   private prune(now:number){this.history=this.history.filter(sample=>now-sample.at<=CONTROL.historyMs).slice(-CONTROL.historyMax);}
+  /* Devuelve una vista del estado, calcula frescura y habilitación de controles
+   * y recorta el historial al intervalo de visualización. */
   snapshot(){
     const now=this.clock();this.prune(now);
     const age=this.lastAt===null?null:Math.max(0,now-this.lastAt);

@@ -1,7 +1,14 @@
+/**
+ * Gráficas SVG con ventana temporal móvil de 60 s. Velocidades en cm/s
+ * y posición en cm; las curvas comparten el reloj y conservan huecos ante
+ * ausencia de muestras. El cursor muestra valores de la muestra más próxima.
+ * El componente no interpola datos para el control ni calcula G(s).
+ */
 import {useState} from 'react';
 import {CONTROL} from '../shared/control-protocol.mjs';
 import type {Sample} from './lab-state';
 
+/* Dibuja curvas y escalas con las muestras disponibles, sin modificar el historial. */
 export function TrendChart({samples,now,kind}:{samples:Sample[];now:number;kind:'speed'|'position'}){
   const [hover,setHover]=useState<number|null>(null);
   const speed=kind==='speed';const width=600,height=245,left=48,right=16,top=20,bottom=42;
@@ -10,6 +17,8 @@ export function TrendChart({samples,now,kind}:{samples:Sample[];now:number;kind:
   const maximum=speed?Math.max(1,...values)*1.12:Math.max(CONTROL.beltLengthCm,...values);
   const x=(time:number)=>left+(1+(time-now)/CONTROL.historyMs)*(width-left-right);
   const y=(value:number)=>top+(1-value/maximum)*(height-top-bottom);
+  /* Interrumpe el trazo ante null o intervalos sin datos, evitando unir
+   * visualmente muestras separadas por una desconexión. */
   const path=(key:'speed'|'reference'|'position'|'modelSpeed'|'simulatedSpeed'|'simulatedPosition')=>{
     let drawing=false,previous=0;
     return data.map(sample=>{
@@ -21,7 +30,7 @@ export function TrendChart({samples,now,kind}:{samples:Sample[];now:number;kind:
   const hovered=hover===null?null:data.reduce<Sample|null>((nearest,sample)=>!nearest||Math.abs(x(sample.at)-hover)<Math.abs(x(nearest.at)-hover)?sample:nearest,null);
   const hoveredValue=hovered?(speed?hovered.speed:hovered.position):null;
   return <div className="trend">
-    <div className="trend-legend"><span className="measured-key">{speed?'Encoder físico':'Ultrasónico'}</span>{speed&&<span className="reference-key">Referencia ESP32</span>}<>{speed&&<span className="model-key">Modelo G(s)</span>}{data.some(sample=>sample.simulated)&&<span className="simulation-key">Falla simulada</span>}</>{speed&&<span className="alarm-key">Divergencia</span>}</div>
+    <div className="trend-legend"><span className="measured-key">{speed?'Encoder físico':'Ultrasónico'}</span>{speed&&<span className="reference-key">Referencia ESP32</span>}<>{speed&&<span className="model-key">Modelo G(s)</span>}{data.some(sample=>(speed?sample.simulatedSpeed:sample.simulatedPosition)!==null)&&<span className="simulation-key">Falla simulada</span>}</>{speed&&<span className="alarm-key">Divergencia</span>}</div>
     <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={(speed?'Velocidad de la banda en centímetros por segundo':'Posición del objeto en centímetros')+', últimos 60 segundos'} onPointerLeave={()=>setHover(null)} onPointerMove={event=>{const rect=event.currentTarget.getBoundingClientRect();setHover((event.clientX-rect.left)/rect.width*width);}}>
       <title>{(speed?'Velocidad de la banda':'Posición del objeto')+' · últimos 60 segundos'}</title>
       {[0,1,2,3,4].map(i=>{const value=maximum*i/4;return <g key={i}><line className="chart-grid" x1={left} x2={width-right} y1={y(value)} y2={y(value)}/><text x={left-9} y={y(value)+4} textAnchor="end">{value.toFixed(speed?1:0)}</text></g>;})}

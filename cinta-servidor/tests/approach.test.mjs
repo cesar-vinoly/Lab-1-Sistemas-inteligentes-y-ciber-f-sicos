@@ -1,3 +1,8 @@
+/**
+ * Pruebas automatizadas de perfil de aproximación, despeje y rearranque automático.
+ * Los relojes/dispositivos simulados permiten reproducir transiciones sin hardware.
+ * Estas verificaciones no sustituyen un ensayo físico de la cinta.
+ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {ConveyorController} from '../control/pid.mjs';

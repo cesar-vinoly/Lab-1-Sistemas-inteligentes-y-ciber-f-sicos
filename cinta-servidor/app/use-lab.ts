@@ -1,11 +1,18 @@
+/**
+ * Adaptador React del estado del laboratorio. Mantiene una conexión /ws/ui,
+ * reconecta cuando se pierde y convierte el reloj del servidor al reloj local.
+ * Las acciones del usuario se envían al backend; el estado confirmado regresa
+ * por WebSocket. La telemetría se publica de inmediato para minimizar desfases.
+ */
 import {flushSync} from 'react-dom';
 import {useCallback,useEffect,useRef,useState} from 'react';
-import {CONTROL,parseTelemetry} from '../shared/control-protocol.mjs';
+import {CONTROL,FAULTS,parseTelemetry} from '../shared/control-protocol.mjs';
 import type {PidConfig} from '../shared/control-protocol.mjs';
 import {LabState} from './lab-state.ts';
 import type {Fault} from './lab-state.ts';
 import {clientId} from './client-id.ts';
 
+/* Gestiona el ciclo de vida de conexión y expone estado, mando, fallas y PID. */
 export function useLab(){
   const [store]=useState(()=>new LabState());
   const [state,setState]=useState(()=>store.snapshot());
@@ -13,11 +20,17 @@ export function useLab(){
   useEffect(()=>{
     let serverOffset=0;
     let alive=true,reconnect:ReturnType<typeof setTimeout>|undefined;
+    const syncFaults=(value:Partial<Record<Fault,number>>={})=>{
+      for(const key of Object.keys(FAULTS) as Fault[])store.setFault(key,typeof value[key]==='number');
+    };
     const refresh=()=>{if(alive)setState(store.snapshot());};
+    /* Abre el canal del navegador con el mismo origen HTTP/HTTPS de la página. */
     const connect=()=>{
       const url=new URL('/ws/ui',window.location.href);url.protocol=url.protocol==='https:'?'wss:':'ws:';
       const ws=new WebSocket(url);socket.current=ws;
       ws.onopen=()=>{if(!alive)return;store.setBridge(true);refresh();};
+      /* Despacha mensajes según tipo; conserva el tiempo del servidor y publica
+       * inmediatamente la telemetría que determina el movimiento 3D. */
       ws.onmessage=event=>{
         if(!alive)return;
         try{
@@ -25,6 +38,7 @@ export function useLab(){
           if(message.type==='snapshot'){
             serverOffset=performance.now()-(message.clockMs??performance.now());
             store.setLink(message.link.connected,message.link.session);
+            syncFaults(message.faults);
             if(message.controller)store.setController(message.controller,serverOffset);
             if(message.last){const data=parseTelemetry(message.last.data);if(data)store.ingest(data,performance.now()-message.last.ageMs,message.last.model);}
           }else if(message.type==='link')store.setLink(message.connected,message.session);
@@ -33,6 +47,8 @@ export function useLab(){
             const data=parseTelemetry(message.data);if(data)store.ingest(data,typeof message.timeMs==='number'?message.timeMs+serverOffset:performance.now(),message.model);
           }else if(message.type==='command')store.command(message);
           else if(message.type==='controller')store.setController(message.state,serverOffset);
+          else if(message.type==='faults')syncFaults(message.state);
+          else if(message.type==='fault-result')store.response=message.response;
           else if(message.type==='pid-result')store.response=message.response;
           else return; // Event log remains a server protocol feature, not a web panel.
           // Commit new measurements in this same WS callback; no panel timer
@@ -50,6 +66,7 @@ export function useLab(){
     connect();const tick=setInterval(refresh,CONTROL.refreshMs);
     return()=>{alive=false;clearInterval(tick);clearTimeout(reconnect);socket.current?.close();socket.current=null;};
   },[store]);
+  /* Genera un id por mando y muestra el estado pendiente hasta recibir respuesta. */
   const send=useCallback((command:string)=>{
     const id=clientId();
     if(socket.current?.readyState!==WebSocket.OPEN || !store.connected){
@@ -64,7 +81,14 @@ export function useLab(){
     }
     setState(store.snapshot());
   },[store]);
-  const setFault=useCallback((key:Fault,enabled:boolean)=>{store.setFault(key,enabled);setState(store.snapshot());},[store]);
+  /* Solicita cambiar una falla; la casilla se actualiza con el estado del backend. */
+  const setFault=useCallback((key:Fault,enabled:boolean)=>{
+    if(socket.current?.readyState!==WebSocket.OPEN)store.response='Sin conexión con el servidor.';
+    else try{socket.current.send(JSON.stringify({type:'fault',id:clientId(),key,enabled}));}
+    catch{store.response='No se pudo cambiar la simulación.';}
+    setState(store.snapshot());
+  },[store]);
+  /* Envía configuración o selección PID, sin ejecutar el controlador en React. */
   const sendPid=useCallback((action:'configure'|'enable'|'disable',config?:PidConfig)=>{
     if(socket.current?.readyState!==WebSocket.OPEN){store.response='Sin conexión con el servidor.';}
     else{

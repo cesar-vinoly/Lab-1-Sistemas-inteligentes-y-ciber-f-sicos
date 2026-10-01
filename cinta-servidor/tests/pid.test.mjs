@@ -1,3 +1,8 @@
+/**
+ * Pruebas automatizadas de controlador, planta dinámica, estados y compatibilidad de comunicación.
+ * Los relojes/dispositivos simulados permiten reproducir transiciones sin hardware.
+ * Estas verificaciones no sustituyen un ensayo físico de la cinta.
+ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -77,8 +82,8 @@ test('gemelo y gráfica usan encoder físico; el mando, G(s) y fallas no reempla
   const twin=createTransmission();twin.setMotion(state.snapshot().control,now);twin.update(16);
   assert.equal(twin.getState().driveRpm,0); // DIR=STOP despite the server command.
   state.setFault('perdida_vel',true);now=250;c.observe(raw({dir:'FWD',v:35,state:'RAMP',vel_r:4,rpm_r:19,rpm_m:30}),now);state.setController(c.snapshot());state.ingest(c.latest,now,c.lastModel);
-  assert.equal(state.latest.vel_r,3);assert.equal(state.raw.vel_r,4);
-  const sample=state.history.at(-1);assert.equal(sample.speed,4);assert.equal(sample.simulatedSpeed,3);assert.equal(sample.at,250);assert.equal(sample.modelSpeed,c.lastModel.speedCmS);
+  assert.equal(state.latest.vel_r,4);assert.equal(state.raw.vel_r,4);
+  const sample=state.history.at(-1);assert.equal(sample.speed,4);assert.equal(sample.simulatedSpeed,null);assert.equal(sample.at,250);assert.equal(sample.modelSpeed,c.lastModel.speedCmS);
   c.applied(-35,now);state.setController(c.snapshot());assert.equal(state.snapshot().control.direction,-1);close(state.snapshot().control.driveRpm,30);
   state.command({type:'command',id:'stop',command:'E',status:'queued',response:'E',latencyMs:null});close(state.snapshot().control.driveRpm,30);
   now=500;state.ingest(raw(),now);assert.equal(state.snapshot().control.driveRpm,0);

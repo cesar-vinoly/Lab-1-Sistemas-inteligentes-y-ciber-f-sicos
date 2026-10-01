@@ -1,3 +1,7 @@
+/**
+ * Utilidad de composición de clases CSS: clsx evalúa condiciones y
+ * twMerge resuelve conflictos entre utilidades Tailwind.
+ */
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 

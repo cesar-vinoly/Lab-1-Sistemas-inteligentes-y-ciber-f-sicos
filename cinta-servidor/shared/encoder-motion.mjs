@@ -1,3 +1,10 @@
+/**
+ * Observador dedicado al movimiento del gemelo, independiente del PID.
+ * Compensa visualmente la ventana de aproximadamente 1 s del encoder usando
+ * el estado de rampa que informa la ESP32. En régimen usa el encoder; al
+ * arrancar admite una ventana acotada basada en RPM_M. No altera telemetría.
+ * La parada confirmada cancela la estimación sin agregar inercia visual.
+ */
 import {CONTROL,GEAR_RATIO,validEncoder} from './control-protocol.mjs';
 
 // Visual observer only. RPM_R is a held, roughly one-second measurement;
@@ -17,6 +24,8 @@ export class EncoderMotion {
   startupUntil=0;
   confirmed=false;
 
+  /* Integra RPM_M en la ventana del encoder para estimar su promedio;
+   * rechaza ventanas incompletas o con huecos de telemetría. */
   window(at){
     const start=at-CONTROL.encoderSampleMs;
     while(this.history.length>1&&this.history[1].at<=start)this.history.shift();
@@ -34,6 +43,8 @@ export class EncoderMotion {
   }
 
   /** @param {import('./control-protocol.mjs').Telemetry} raw @param {number} at */
+  /* Conciliación de velocidad medida y rampa nativa. Un cero confirmado
+   * tiene prioridad sobre cualquier extrapolación de movimiento. */
   observe(raw,at){
     const previous=this.history.at(-1);
     if(previous&&at<previous.at)return;

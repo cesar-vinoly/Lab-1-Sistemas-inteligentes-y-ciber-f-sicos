@@ -1,3 +1,10 @@
+/**
+ * Interfaz de mando, medición, divergencias, PID, modelo y gráficas.
+ * Los componentes convierten el estado de useLab en elementos visuales;
+ * no calculan comandos PID ni reemplazan las mediciones del hardware.
+ * La posición enviada al cubo puede ser la copia de deslizamiento, conservando
+ * la validación de presencia sobre POS real.
+ */
 import {useEffect,useRef,useState} from 'react';
 import {CONTROL,FAULTS,PID_DEFAULTS,validEncoder} from '../shared/control-protocol.mjs';
 import type {PidConfig} from '../shared/control-protocol.mjs';
@@ -8,12 +15,15 @@ import type {Fault,LabSnapshot} from './lab-state';
 import './control-dashboard.css';
 
 const directions={FWD:'adelante',REV:'reversa',STOP:'detenida'};
+/* Formatea valores ausentes como raya; no los convierte en cero. */
 function fmt(value:number|null|undefined,decimals=1,suffix=''){
   return value===null||value===undefined?'—':value.toFixed(decimals)+suffix;
 }
 function signed(value:number|null){return value===null?'—':(value>0?'+':'')+value.toFixed(1);}
 function Badge({text,kind='inactivo'}:{text:string;kind?:string}){return <span className={'estado '+kind}>{text}</span>;}
 
+/* Explica el estado de velocidad, posición y comunicación a partir de
+ * mediciones y persistencia evaluadas por LabState. */
 function Divergences({state}:{state:LabSnapshot}){
   const u=state.fresh?state.latest:null;
   let speed={text:'Sin datos',kind:'inactivo',detail:''};
@@ -33,6 +43,8 @@ function Divergences({state}:{state:LabSnapshot}){
   })}</>;
 }
 
+/* Mantiene un borrador de parámetros; solo Aplicar lo envía al backend.
+ * Las restricciones HTML ayudan al usuario y el servidor vuelve a validar. */
 function PidSettings({config,disabled,onApply}:{config:PidConfig;disabled:boolean;onApply:(config:PidConfig)=>void}){
   const [draft,setDraft]=useState(config);
   const revision=JSON.stringify(config);
@@ -67,6 +79,8 @@ export default function ControlDashboard(){
   return <Dashboard {...lab}/>;
 }
 
+/* Compone paneles y enlaza sus eventos con el mando único. El tema visual
+ * se conserva localmente; el estado de máquina procede del servidor. */
 export function Dashboard({state,send,setFault,sendPid}:ReturnType<typeof useLab>){
   const [velocityDraft,setVelocityDraft]=useState<number|null>(null);
   const editing=useRef(false);
@@ -83,12 +97,16 @@ export function Dashboard({state,send,setFault,sendPid}:ReturnType<typeof useLab
   const toggleTheme=()=>{const next=theme==='oscuro'?'claro':'oscuro';setTheme(next);try{localStorage.setItem('cinta-panel-theme',next);}catch{}};
   const connected=state.bridge&&state.connected;
   const u=state.fresh?state.raw:null;
+  const objectPosition=u?.pos!==null&&u?.pos!==undefined&&u.pos>=0&&u.pos<=CONTROL.beltLengthCm
+    ?(state.faults.deslizamiento!==undefined?state.latest?.pos??null:u.pos):null;
   const pid=state.controller;
   const automatic=pid?.enabled??false;
   const anyFaults=Object.keys(state.faults).length>0;
   const differenceRpm=u?.rpm_t===null||!u?null:u.rpm_r-u.rpm_t;
   const row=(name:string,measured:string,reference:string,difference:string,alarm=false)=><tr key={name}><th scope="row">{name}</th><td className="real">{measured}</td><td className="modelo">{reference}</td><td className={alarm?'alarma-txt':''}>{difference}</td></tr>;
   const connectionText=!state.bridge?'Conectando con el servidor':!state.connected?'Esperando ESP32':state.fresh?'ESP32 conectada':'ESP32 conectada sin datos';
+  /* Confirma el deslizador al terminar la interacción, evitando enviar
+   * una orden física por cada movimiento intermedio del puntero. */
   const commitVelocity=(value:number)=>{
     editing.current=false;setVelocityDraft(null);
     if(!automatic&&value!==control.v)send('V'+value);
@@ -106,7 +124,7 @@ export function Dashboard({state,send,setFault,sendPid}:ReturnType<typeof useLab
       </div>
 
       <div className="workspace-grid">
-        <ConveyorViewer motion={control} objectPosition={u?.pos??null}/>
+        <ConveyorViewer motion={control} objectPosition={objectPosition}/>
         <section className="panel mando-panel" aria-labelledby="mando-title"><div className="panel-heading"><h2 id="mando-title">Mando</h2><Badge text={automatic?'PID activo':control.source==='command'?'Orden enviada':state.fresh?'Sincronizado':'Sin datos'} kind={control.source==='command'?'aviso':state.fresh?'normal':'inactivo'}/></div>
           <label className="pid-toggle"><input type="checkbox" checked={automatic} disabled={!state.bridge||(!automatic&&(!connected||!state.fresh||!validEncoder(u)))} onChange={event=>sendPid(event.target.checked?'enable':'disable')}/><span>PID de aproximación y velocidad</span></label>
           {automatic&&<p className="pid-command">Base 100 % · Objetivo {fmt(pid?.config.targetCm,1,' cm')} · Salida {fmt(pid?.outputPercent,0,' %')}</p>}
@@ -136,12 +154,12 @@ export function Dashboard({state,send,setFault,sendPid}:ReturnType<typeof useLab
               {row('Distancia bruta HC-SR04 (cm)',fmt(u?.dist),'','')}
             </tbody></table></div>
             <p className="ayuda">Las referencias de velocidad y giro son datos recibidos de la ESP32.</p>
-            {anyFaults&&<p className="simulation-note">Fallas simuladas: banda {fmt(state.latest?.vel_r,2,' cm/s')}. La curva del encoder y la tabla conservan la medición física.</p>}
+            {anyFaults&&<p className="simulation-note">Simulación activa. Encoder, tabla y CSV conservan las mediciones físicas. El deslizamiento solo modifica la posición visual.</p>}
           </section>
 
         <section className="panel" aria-labelledby="divergencias-title"><h2 id="divergencias-title">Divergencias</h2><Divergences state={state}/>
-          <h3>Simulación de fallas</h3><div className={'fallas '+(anyFaults?'activas':'')}>{Object.entries(FAULTS).map(([key,label])=><label key={key}><input type="checkbox" checked={state.faults[key as Fault]!==undefined} onChange={event=>setFault(key as Fault,event.target.checked)}/><span>{label}</span></label>)}</div>
-          <p className="ayuda">Se aplican sobre los datos recibidos; el hardware no cambia.</p>
+          <h3>Simulación de fallas</h3><div className={'fallas '+(anyFaults?'activas':'')}>{Object.entries(FAULTS).map(([key,label])=><label key={key}><input type="checkbox" checked={state.faults[key as Fault]!==undefined} disabled={!connected||!state.fresh} onChange={event=>setFault(key as Fault,event.target.checked)}/><span>{label}</span></label>)}</div>
+          <p className="ayuda">Pérdida: comando al 75 %. Sobrecarga: reducción progresiva hasta el 45 % en 9,2 s. Ambas se combinan y actúan sobre el motor; el PID respeta el límite. Deslizamiento del objeto. Se desactivan al desconectar la ESP32.</p>
         </section>
         <section className="panel model-panel" aria-labelledby="modelo-title"><div className="panel-heading"><h2 id="modelo-title">Modelo</h2><Badge text={!automatic?'PID desactivado':pid?.status==='fault'?'PID activo · sin salida':pid?.status==='waiting'?'PID activo · esperando datos':pid?.status==='paused'?'PID activo · cinta detenida':'PID activo'} kind={pid?.status==='fault'?'alarma':automatic?'normal':'inactivo'}/></div>
           <div className="plant-equation" role="math" aria-label="G de s igual a la fracción: numerador, 0.004656 por s más 0.1425; denominador, s al cuadrado más 4.286 por s más 8.058.">
